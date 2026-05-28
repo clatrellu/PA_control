@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(uv add *)",
+      "Bash(mkdir -p /home/xray/Documents/repos/PA_setup/hardware /home/xray/Documents/repos/PA_setup/gui && ls /home/xray/Documents/repos/PA_setup/)",
+      "Bash(mkdir -p /home/xray/Documents/repos/PA_setup_web/hardware /home/xray/Documents/repos/PA_setup_web/frontend)",
+      "Read(//home/xray/Documents/repos/**)",
+      "Bash(uv init *)"
+    ],
+    "additionalDirectories": [
+      "/home/xray/Documents/repos/PA_setup"
+    ]
+  }
+}

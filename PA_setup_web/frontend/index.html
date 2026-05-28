@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PA Setup Control</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <!-- uPlot: fastest JS time-series chart (Canvas-based, no framework) -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.min.css">
+  <script src="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.min.js"></script>
+</head>
+<body>
+<div id="app">
+
+  <!-- ── Header ─────────────────────────────────────── -->
+  <header>
+    <h1>PA Setup Control</h1>
+    <span id="mock-badge">MOCK</span>
+    <span id="status-bar">Ready</span>
+  </header>
+
+  <!-- ── Sidebar ────────────────────────────────────── -->
+  <aside id="sidebar">
+
+    <!-- Connections -->
+    <div class="panel">
+      <h2>Connections</h2>
+
+      <!-- Laser -->
+      <div class="row">
+        <label>Laser</label>
+        <input type="text" id="inp-laser-port" class="port" value="COM3">
+        <button id="btn-laser-connect" class="btn-connect" data-connected="false"
+                onclick="connectLaser()">Connect</button>
+        <span id="dot-laser" class="dot">●</span>
+      </div>
+
+      <!-- Galvo -->
+      <div class="row">
+        <label>X ch</label>
+        <input type="text" id="inp-galvo-x" class="channel" value="Dev1/ao0">
+        <label>Y ch</label>
+        <input type="text" id="inp-galvo-y" class="channel" value="Dev1/ao1">
+      </div>
+      <div class="row">
+        <button id="btn-galvo-connect" class="btn-connect" style="margin-left:44px"
+                data-connected="false" onclick="connectGalvo()">Connect Galvo</button>
+        <span id="dot-galvo" class="dot">●</span>
+      </div>
+
+      <!-- Scope -->
+      <div class="row">
+        <button id="btn-scope-connect" class="btn-connect" style="margin-left:44px"
+                data-connected="false" onclick="connectScope()">Connect Scope</button>
+        <span id="dot-scope" class="dot">●</span>
+      </div>
+
+      <!-- Trigger -->
+      <div class="row">
+        <label>Trig ch</label>
+        <input type="text" id="inp-trig-ch" class="channel" value="Dev1/ctr0">
+        <button id="btn-trig-connect" class="btn-connect" data-connected="false"
+                onclick="connectTrigger()">Connect</button>
+        <span id="dot-trig" class="dot">●</span>
+      </div>
+    </div>
+
+    <!-- Laser controls -->
+    <div class="panel">
+      <h2>Laser</h2>
+      <div class="row">
+        <button id="btn-laser-emit" data-on="false" disabled
+                onclick="toggleLaserEmission()">Emission OFF</button>
+        <span id="lbl-laser-actual" style="margin-left:auto;color:#888">-- mW</span>
+      </div>
+      <div class="row" style="margin-top:4px">
+        <label>Power</label>
+        <input type="range" id="sl-laser-power" min="0" max="2000" value="0" disabled>
+        <input type="number" id="inp-laser-power" min="0" max="200" step="0.1"
+               value="0" disabled>
+        <span style="color:var(--muted)">mW</span>
+      </div>
+      <div class="row" style="margin-top:2px">
+        <label>Mode</label>
+        <select id="sel-laser-mode" disabled onchange="setLaserMode(this.value)"
+                title="CW: continuous. External: fires on each TTL pulse from trigger output.&#10;Start the trigger before switching to External.">
+          <option value="cw">CW</option>
+          <option value="external">External trigger</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- Galvo controls -->
+    <div class="panel">
+      <h2>Galvo Mirrors</h2>
+      <div class="row">
+        <label>X</label>
+        <input type="range" id="sl-galvo-x" min="-1000" max="1000" value="0" disabled>
+        <input type="number" id="inp-galvo-xv" min="-10" max="10" step="0.01"
+               value="0.00" disabled>
+        <span style="color:var(--muted)">V</span>
+      </div>
+      <div class="row">
+        <label>Y</label>
+        <input type="range" id="sl-galvo-y" min="-1000" max="1000" value="0" disabled>
+        <input type="number" id="inp-galvo-yv" min="-10" max="10" step="0.01"
+               value="0.00" disabled>
+        <span style="color:var(--muted)">V</span>
+      </div>
+      <div class="row">
+        <button id="btn-galvo-center" disabled style="margin-left:44px"
+                onclick="centerGalvo()">Center (0 V, 0 V)</button>
+      </div>
+    </div>
+
+    <!-- Trigger -->
+    <div class="panel">
+      <h2>Trigger (laser rep. rate)</h2>
+      <div class="row">
+        <label>Freq</label>
+        <input type="number" id="inp-trig-freq" min="1" max="100000" step="1"
+               value="1000" disabled>
+        <span style="color:var(--muted)">Hz</span>
+        <button class="preset-btn" onclick="setTrigPreset(100)"  disabled id="pb100" >100 Hz</button>
+        <button class="preset-btn" onclick="setTrigPreset(1000)" disabled id="pb1k"  >1 kHz</button>
+        <button class="preset-btn" onclick="setTrigPreset(10000)"disabled id="pb10k" >10 kHz</button>
+        <button class="preset-btn" onclick="setTrigPreset(50000)"disabled id="pb50k" >50 kHz</button>
+      </div>
+      <div class="row">
+        <label>Duty</label>
+        <input type="number" id="inp-trig-duty" min="1" max="50" step="0.5"
+               value="5" disabled>
+        <span style="color:var(--muted)">%</span>
+        <span style="color:var(--muted);font-size:11px;margin-left:6px" id="lbl-pulse-width"></span>
+      </div>
+      <div class="row" style="margin-top:4px">
+        <button id="btn-trig-start" disabled onclick="startTrigger()">▶ Start</button>
+        <button id="btn-trig-stop"  disabled onclick="stopTrigger()">■ Stop</button>
+        <span id="dot-trig-run" class="dot" style="font-size:16px">●</span>
+      </div>
+    </div>
+
+    <!-- Log -->
+    <div class="panel" style="flex:1">
+      <h2>Log</h2>
+      <div id="log"></div>
+    </div>
+
+  </aside>
+
+  <!-- ── Main panel ─────────────────────────────────── -->
+  <main id="main">
+
+    <!-- Waveform plot -->
+    <div id="plot-container"></div>
+
+    <!-- Acquisition controls -->
+    <div class="panel" id="acq-panel">
+      <h2>Acquisition</h2>
+      <div class="row">
+        <label>Rate</label>
+        <select id="sel-rate">
+          <option value="125000000">125 MS/s</option>
+          <option value="62500000">62.5 MS/s</option>
+          <option value="31250000">31.25 MS/s</option>
+          <option value="10000000">10 MS/s</option>
+          <option value="1000000">1 MS/s</option>
+        </select>
+
+        <label>Duration</label>
+        <input type="number" id="inp-duration" min="0.01" max="1000" step="0.1" value="1.0">
+        <span style="color:var(--muted)">ms</span>
+
+        <label>Trigger</label>
+        <input type="number" id="inp-trigger" min="-500" max="500" step="1" value="0">
+        <span style="color:var(--muted)">mV</span>
+
+        <label>Ch</label>
+        <select id="sel-channel" style="width:52px">
+          <option>A</option><option>B</option><option>C</option><option>D</option>
+        </select>
+
+        <label>Coupling</label>
+        <select id="sel-coupling" style="width:58px">
+          <option>DC</option><option>AC</option>
+        </select>
+
+        <label>Range</label>
+        <select id="sel-range" style="width:80px">
+          <option>10 mV</option><option>20 mV</option><option>50 mV</option>
+          <option>100 mV</option><option>200 mV</option>
+          <option selected>500 mV</option>
+          <option>1 V</option><option>2 V</option><option>5 V</option>
+          <option>10 V</option><option>20 V</option>
+        </select>
+      </div>
+
+      <div class="row" style="margin-top:4px">
+        <button onclick="singleCapture()">Single Capture</button>
+        <button id="btn-continuous" onclick="toggleContinuous()">Continuous</button>
+        <button id="btn-stop" disabled onclick="stopContinuous()">Stop</button>
+        <button id="btn-save" disabled onclick="saveTrace()">Save CSV…</button>
+      </div>
+    </div>
+
+  </main>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

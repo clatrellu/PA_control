@@ -1,0 +1,13 @@
+[project]
+name = "pa-setup"
+version = "0.1.0"
+description = "PA Setup desktop GUI (PyQt6)"
+requires-python = ">=3.12"
+dependencies = [
+    "pa-hardware",
+    "PyQt6>=6.11.0",
+    "pyqtgraph>=0.14.0",
+]
+
+[tool.uv.sources]
+pa-hardware = { path = "../pa_hardware", editable = true }
