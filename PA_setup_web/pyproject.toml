@@ -1,13 +1,12 @@
 [project]
-name = "pa-setup"
+name = "pa-setup-web"
 version = "0.1.0"
-description = "PA Setup desktop GUI (PyQt6)"
+description = "PA Setup web GUI (FastAPI + browser)"
 requires-python = ">=3.12"
 dependencies = [
     "pa-hardware",
-    "picosdk>=1.1",
-    "PyQt6>=6.11.0",
-    "pyqtgraph>=0.14.0",
+    "fastapi>=0.136.3",
+    "uvicorn[standard]>=0.48.0",
 ]
 
 [tool.uv.sources]

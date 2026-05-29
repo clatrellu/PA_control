@@ -1,0 +1,41 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "PA Setup Qt (RedPitaya)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/PA_setup_Qt/main.py",
+            "cwd": "${workspaceFolder}/PA_setup_Qt",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "args": ["--scope", "redpitaya"],
+            "env": {
+                "LD_LIBRARY_PATH": "/opt/picoscope/lib"
+            }
+        },
+        {
+            "name": "PA Setup Qt (PicoScope)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/PA_setup_Qt/main.py",
+            "cwd": "${workspaceFolder}/PA_setup_Qt",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "args": ["--scope", "picoscope"],
+            "env": {
+                "LD_LIBRARY_PATH": "/opt/picoscope/lib"
+            }
+        },
+        {
+            "name": "PA Setup Qt (mock)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/PA_setup_Qt/main.py",
+            "cwd": "${workspaceFolder}/PA_setup_Qt",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "args": ["--mock"],
+            "env": {
+                "LD_LIBRARY_PATH": "/opt/picoscope/lib"
+            }
+        }
+    ]
+}

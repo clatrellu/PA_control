@@ -1,4 +1,4 @@
-"""Entry point — run with: uv run python main.py [--mock]"""
+"""Entry point — run with: uv run python main.py [--mock] [--scope {redpitaya,picoscope}]"""
 import sys
 import argparse
 
@@ -30,7 +30,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="PA Setup Control GUI")
     parser.add_argument(
         "--mock", action="store_true",
-        help="Use simulated hardware (no instruments needed)"
+        help="Use simulated hardware (no instruments needed)",
+    )
+    parser.add_argument(
+        "--scope", choices=["redpitaya", "picoscope"], default="redpitaya",
+        help="Oscilloscope model to use (default: redpitaya)",
     )
     args = parser.parse_args()
 
@@ -39,7 +43,7 @@ def main() -> None:
     app.setStyle("Fusion")
     _apply_dark_palette(app)
 
-    window = MainWindow(mock=args.mock)
+    window = MainWindow(mock=args.mock, scope_type=args.scope)
     window.show()
     sys.exit(app.exec())
 

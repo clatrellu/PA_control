@@ -86,9 +86,9 @@ class GalvoMoveReq(BaseModel):
     y_v: float
 
 class ScopeConfigReq(BaseModel):
-    channel: str = "A"
+    channel: str = "CH1"
     coupling: str = "DC"
-    range_label: str = "500 mV"
+    range_label: str = "1 V"
 
 class TriggerConnectReq(BaseModel):
     channel: str = "Dev1/ctr0"
@@ -292,9 +292,9 @@ async def scope_ws(ws: WebSocket):
                     acq_task = None
                 stop_evt.clear()
                 _scope.configure_channel(
-                    msg.get("channel", "A"),
+                    msg.get("channel", "CH1"),
                     msg.get("coupling", "DC"),
-                    msg.get("range_label", "500 mV"),
+                    msg.get("range_label", "1 V"),
                 )
                 t, v = await asyncio.to_thread(
                     _scope.capture_block,
@@ -310,9 +310,9 @@ async def scope_ws(ws: WebSocket):
                     await asyncio.shield(acq_task)
                 stop_evt.clear()
                 _scope.configure_channel(
-                    msg.get("channel", "A"),
+                    msg.get("channel", "CH1"),
                     msg.get("coupling", "DC"),
-                    msg.get("range_label", "500 mV"),
+                    msg.get("range_label", "1 V"),
                 )
                 acq_task = asyncio.create_task(_capture_loop(msg))
 

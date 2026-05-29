@@ -1,0 +1,2 @@
+[tool.uv.workspace]
+members = ["pa_hardware", "PA_setup_Qt", "PA_setup_web"]

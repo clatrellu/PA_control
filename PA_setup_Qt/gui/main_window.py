@@ -15,33 +15,50 @@ from pa_hardware import (
     LaserController, MockLaserController,
     GalvoController, MockGalvoController,
     OscilloscopeController, MockOscilloscopeController,
+    PicoScope5444DController, MockPicoScope5444DController,
     TriggerController, MockTriggerController,
 )
-from gui.laser_widget import LaserWidget
-from gui.galvo_widget import GalvoWidget
-from gui.oscilloscope_widget import OscilloscopeWidget
-from gui.trigger_widget import TriggerWidget
+from .laser_widget import LaserWidget
+from .galvo_widget import GalvoWidget
+from .oscilloscope_widget import OscilloscopeWidget
+from .trigger_widget import TriggerWidget
+
+_SCOPE_NAMES = {
+    "redpitaya": "Red Pitaya STEM 125-10",
+    "picoscope": "PicoScope 5444D MSO",
+}
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, mock: bool = False):
+    def __init__(self, mock: bool = False, scope_type: str = "redpitaya"):
         super().__init__()
         self._mock = mock
+        self._scope_type = scope_type
 
         # Hardware instances
         self._laser   = MockLaserController()   if mock else LaserController()
         self._galvo   = MockGalvoController()   if mock else GalvoController()
-        self._scope   = MockOscilloscopeController() if mock else OscilloscopeController()
+        self._scope   = self._make_scope(mock, scope_type)
         self._trigger = MockTriggerController() if mock else TriggerController()
 
-        self.setWindowTitle("PA Setup Control" + (" [MOCK]" if mock else ""))
+        scope_label = _SCOPE_NAMES.get(scope_type, scope_type)
+        title = f"PA Setup Control — {scope_label}"
+        if mock:
+            title += " [MOCK]"
+        self.setWindowTitle(title)
         self.setMinimumSize(1100, 650)
         self._setup_ui()
         self._setup_menu()
 
         if mock:
-            self._log("Mock mode active — no hardware required.")
+            self._log(f"Mock mode active — {scope_label} simulated.")
             self._auto_connect_mock()
+
+    @staticmethod
+    def _make_scope(mock: bool, scope_type: str):
+        if scope_type == "picoscope":
+            return MockPicoScope5444DController() if mock else PicoScope5444DController()
+        return MockOscilloscopeController() if mock else OscilloscopeController()
 
     # ------------------------------------------------------------------
     # UI construction
@@ -96,7 +113,7 @@ class MainWindow(QMainWindow):
         scroll = QScrollArea()
         scroll.setWidget(container)
         scroll.setWidgetResizable(True)
-        scroll.setFixedWidth(330)
+        scroll.setMinimumWidth(280)
         scroll.setFrameShape(QScrollArea.Shape.NoFrame)
         return scroll
 
@@ -143,11 +160,13 @@ class MainWindow(QMainWindow):
         galvo_btn_row.addWidget(self._lbl_galvo_status)
         layout.addLayout(galvo_btn_row)
 
-        # Scope row
+        # Scope row — label shows which model is configured
         scope_row = QHBoxLayout()
+        scope_label = _SCOPE_NAMES.get(self._scope_type, self._scope_type)
+        scope_row.addWidget(QLabel(f"Scope ({scope_label}):"))
         scope_row.addStretch()
-        self._btn_scope_connect = QPushButton("Connect Scope")
-        self._btn_scope_connect.setFixedWidth(110)
+        self._btn_scope_connect = QPushButton("Connect")
+        self._btn_scope_connect.setFixedWidth(80)
         self._btn_scope_connect.clicked.connect(self._on_scope_connect)
         scope_row.addWidget(self._btn_scope_connect)
         self._lbl_scope_status = QLabel("●")
@@ -264,25 +283,22 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot()
     def _on_scope_connect(self) -> None:
+        scope_label = _SCOPE_NAMES.get(self._scope_type, self._scope_type)
         if self._scope.is_connected:
             self._scope.disconnect()
             self._scope_widget.set_scope(self._scope)
             self._set_status(self._lbl_scope_status, False)
-            self._btn_scope_connect.setText("Connect Scope")
+            self._btn_scope_connect.setText("Connect")
             self._log("Scope disconnected.")
         else:
             try:
                 self._scope.connect()
                 self._scope_widget.set_scope(self._scope)
                 self._set_status(self._lbl_scope_status, True)
-                self._btn_scope_connect.setText("Disconnect Scope")
-                self._log("PicoScope connected.")
+                self._btn_scope_connect.setText("Disconnect")
+                self._log(f"{scope_label} connected.")
             except Exception as e:
                 self._log(f"Scope connection failed: {e}")
-
-    # ------------------------------------------------------------------
-    # Laser slots
-    # ------------------------------------------------------------------
 
     @pyqtSlot()
     def _on_trigger_connect(self) -> None:
@@ -382,14 +398,15 @@ class MainWindow(QMainWindow):
         self._status_bar.showMessage(msg)
 
     def _show_about(self) -> None:
+        scope_label = _SCOPE_NAMES.get(self._scope_type, self._scope_type)
         QMessageBox.about(
             self,
             "PA Setup Control",
-            "Laser · Galvo · PicoScope control GUI\n\n"
-            "Instruments:\n"
-            "  • Cobolt laser (serial)\n"
-            "  • Thorlabs galvo mirrors (NI-DAQ)\n"
-            "  • PicoScope 5000 series",
+            f"Laser · Galvo · Oscilloscope control GUI\n\n"
+            f"Instruments:\n"
+            f"  • Cobolt laser (serial)\n"
+            f"  • Thorlabs galvo mirrors (NI-DAQ)\n"
+            f"  • {scope_label}",
         )
 
     # ------------------------------------------------------------------

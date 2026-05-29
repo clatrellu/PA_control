@@ -12,17 +12,6 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QThread, QObject, pyqtSignal, pyqtSlot
 
-from pa_hardware.oscilloscope import RANGE_LABELS, CHANNEL_LABELS, COUPLING_LABELS
-
-# Preset sample rates shown in the combo box
-SAMPLE_RATES = {
-    "125 MS/s": 125e6,
-    "62.5 MS/s": 62.5e6,
-    "31.25 MS/s": 31.25e6,
-    "10 MS/s": 10e6,
-    "1 MS/s": 1e6,
-}
-
 
 class _AcquisitionWorker(QObject):
     data_ready = pyqtSignal(object, object)   # time_us, voltage_mv (np.ndarray)
@@ -52,7 +41,7 @@ class _AcquisitionWorker(QObject):
 
 
 class OscilloscopeWidget(QWidget):
-    """Waveform display and acquisition controls for a PicoScope 5000."""
+    """Waveform display and acquisition controls — adapts to any scope backend."""
 
     log_message = pyqtSignal(str)
 
@@ -64,11 +53,13 @@ class OscilloscopeWidget(QWidget):
         self._thread: QThread | None = None
         self._worker: _AcquisitionWorker | None = None
         self._setup_ui()
+        self._populate_combos()
 
     def set_scope(self, scope) -> None:
-        """Replace the scope backend (e.g. when switching mock ↔ real)."""
+        """Replace the scope backend and refresh controls to match its capabilities."""
         self._stop_acquisition()
         self._scope = scope
+        self._populate_combos()
 
     # ------------------------------------------------------------------
     # UI construction
@@ -103,7 +94,6 @@ class OscilloscopeWidget(QWidget):
 
         settings.addWidget(QLabel("Sample rate:"))
         self._cb_rate = QComboBox()
-        self._cb_rate.addItems(list(SAMPLE_RATES.keys()))
         self._cb_rate.setFixedWidth(110)
         settings.addWidget(self._cb_rate)
 
@@ -126,21 +116,16 @@ class OscilloscopeWidget(QWidget):
 
         settings.addWidget(QLabel("Ch:"))
         self._cb_channel = QComboBox()
-        self._cb_channel.addItems(CHANNEL_LABELS)
-        self._cb_channel.setFixedWidth(50)
+        self._cb_channel.setFixedWidth(55)
         settings.addWidget(self._cb_channel)
 
         settings.addWidget(QLabel("Coupling:"))
         self._cb_coupling = QComboBox()
-        self._cb_coupling.addItems(COUPLING_LABELS)
-        self._cb_coupling.setCurrentText("DC")
         self._cb_coupling.setFixedWidth(55)
         settings.addWidget(self._cb_coupling)
 
         settings.addWidget(QLabel("Range:"))
         self._cb_range = QComboBox()
-        self._cb_range.addItems(RANGE_LABELS)
-        self._cb_range.setCurrentText("500 mV")
         self._cb_range.setFixedWidth(80)
         settings.addWidget(self._cb_range)
 
@@ -176,18 +161,39 @@ class OscilloscopeWidget(QWidget):
 
         return group
 
+    def _populate_combos(self) -> None:
+        """Fill combo boxes with options exposed by the current scope class."""
+        cls = type(self._scope)
+
+        self._cb_rate.clear()
+        self._cb_rate.addItems(list(cls.SAMPLE_RATES.keys()))
+
+        self._cb_channel.clear()
+        self._cb_channel.addItems(cls.CHANNEL_LABELS)
+
+        self._cb_coupling.clear()
+        self._cb_coupling.addItems(cls.COUPLING_LABELS)
+        if "DC" in cls.COUPLING_LABELS:
+            self._cb_coupling.setCurrentText("DC")
+
+        self._cb_range.clear()
+        self._cb_range.addItems(cls.RANGE_LABELS)
+        if "1 V" in cls.RANGE_LABELS:
+            self._cb_range.setCurrentText("1 V")
+
     # ------------------------------------------------------------------
     # Acquisition
     # ------------------------------------------------------------------
 
     def _get_acq_params(self) -> dict:
+        cls = type(self._scope)
         self._scope.configure_channel(
             channel=self._cb_channel.currentText(),
             coupling=self._cb_coupling.currentText(),
             range_label=self._cb_range.currentText(),
         )
         return {
-            "sample_rate_hz": SAMPLE_RATES[self._cb_rate.currentText()],
+            "sample_rate_hz": cls.SAMPLE_RATES[self._cb_rate.currentText()],
             "duration_ms": self._spin_duration.value(),
             "trigger_mv": self._spin_trigger.value(),
         }
@@ -197,8 +203,6 @@ class OscilloscopeWidget(QWidget):
 
         params = self._get_acq_params()
         self._worker = _AcquisitionWorker(self._scope, params)
-        if not continuous:
-            self._worker._running = False   # will run exactly once
 
         self._thread = QThread()
         self._worker.moveToThread(self._thread)
@@ -208,9 +212,7 @@ class OscilloscopeWidget(QWidget):
         self._worker.finished.connect(self._on_worker_finished)
 
         if not continuous:
-            # Single shot: make the worker stop after the first capture
-            self._worker._running = True
-
+            # Single shot: run exactly once outside the worker loop
             def _run_once():
                 try:
                     t, v = self._scope.capture_block(**params)

@@ -1,0 +1,6 @@
+{
+    "python.defaultInterpreterPath": "/home/xray/Documents/repos/PA_control/.venv/bin/python",
+    "python.venvFolders": [],
+    "python.terminal.activateEnvironment": false,
+    "python.createEnvironment.trigger": "off"
+}
