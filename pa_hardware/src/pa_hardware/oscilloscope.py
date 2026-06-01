@@ -34,7 +34,8 @@ RP_SAMPLE_RATES: dict[str, float] = {
     "1 MS/s":     1e6,
 }
 
-RP_DEFAULT_IP = "169.254.127.245"
+RP_DEFAULT_IP ="192.168.1.100"
+ #"169.254.127.245"
 
 
 def _rate_to_decimation(rate_hz: float) -> int:
@@ -156,16 +157,20 @@ class OscilloscopeController:
         # DLY = n_samples: capture exactly n_samples post-trigger before stopping
         self._send(f"ACQ:TRIG:DLY {n_samples}")
         self._send("ACQ:START")
-        self._send(f"ACQ:TRIG CH{ch}_PE")
 
-        # Wait for trigger (max 5 s)
-        deadline = time.monotonic() + 5.0
-        while time.monotonic() < deadline:
-            if self._ask("ACQ:TRIG:STAT?") == "TD":
-                break
-            time.sleep(0.005)
+        if trigger_mv == 0.0:
+            # Immediate capture — no edge detection, always returns data
+            self._send("ACQ:TRIG NOW")
         else:
-            raise TimeoutError("Red Pitaya: trigger not detected within 5 s")
+            # Wait for rising edge at the requested threshold (max 5 s)
+            self._send(f"ACQ:TRIG CH{ch}_PE")
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                if self._ask("ACQ:TRIG:STAT?") == "TD":
+                    break
+                time.sleep(0.005)
+            else:
+                raise TimeoutError("Red Pitaya: trigger not detected within 5 s")
 
         # Wait for post-trigger samples to fill at actual_rate
         time.sleep(n_samples / actual_rate + 0.005)

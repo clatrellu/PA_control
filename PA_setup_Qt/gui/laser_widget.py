@@ -2,17 +2,16 @@
 from __future__ import annotations
 from PyQt6.QtWidgets import (
     QGroupBox, QVBoxLayout, QHBoxLayout, QLabel,
-    QPushButton, QDoubleSpinBox, QSlider, QComboBox, QSizePolicy,
+    QPushButton, QDoubleSpinBox, QSlider, QSizePolicy,
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 
 
 class LaserWidget(QGroupBox):
-    """Controls for the Cobolt laser: enable/disable, power setpoint, and modulation mode."""
+    """Controls for the Cobolt laser: enable/disable and power setpoint (USB serial)."""
 
-    power_changed      = pyqtSignal(float)   # emitted when user changes setpoint
-    enable_changed     = pyqtSignal(bool)    # emitted when user toggles emission
-    mode_changed       = pyqtSignal(str)     # 'cw' or 'external'
+    power_changed  = pyqtSignal(float)
+    enable_changed = pyqtSignal(bool)
 
     MAX_POWER_MW = 200.0
 
@@ -67,20 +66,6 @@ class LaserWidget(QGroupBox):
         readback_row.addWidget(self._lbl_actual)
         layout.addLayout(readback_row)
 
-        # --- Modulation mode ---
-        mode_row = QHBoxLayout()
-        mode_row.addWidget(QLabel("Mode:"))
-        self._cb_mode = QComboBox()
-        self._cb_mode.addItems(["CW", "External trigger"])
-        self._cb_mode.setToolTip(
-            "CW: laser on continuously.\n"
-            "External trigger: fires on each TTL pulse from the NI-DAQ counter output.\n"
-            "Start the trigger before switching to External."
-        )
-        self._cb_mode.currentIndexChanged.connect(self._on_mode_changed)
-        mode_row.addWidget(self._cb_mode)
-        mode_row.addStretch()
-        layout.addLayout(mode_row)
 
     # ------------------------------------------------------------------
     # Public API
@@ -90,7 +75,6 @@ class LaserWidget(QGroupBox):
         self._btn_on.setEnabled(connected)
         self._slider.setEnabled(connected)
         self._spin.setEnabled(connected)
-        self._cb_mode.setEnabled(connected)
         if not connected:
             self._btn_on.setChecked(False)
             self._lbl_actual.setText("-- mW")
@@ -135,6 +119,3 @@ class LaserWidget(QGroupBox):
         if not self._building:
             self.power_changed.emit(value)
 
-    def _on_mode_changed(self, index: int) -> None:
-        if not self._building:
-            self.mode_changed.emit("external" if index == 1 else "cw")

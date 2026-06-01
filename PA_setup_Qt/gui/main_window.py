@@ -5,10 +5,10 @@ from datetime import datetime
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QScrollArea, QGroupBox, QLabel, QLineEdit,
-    QPushButton, QComboBox, QSplitter, QTextEdit,
-    QStatusBar, QMenuBar, QMessageBox,
+    QPushButton, QSplitter, QTextEdit,
+    QStatusBar, QMessageBox,
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSlot
+from PyQt6.QtCore import Qt, pyqtSlot
 from PyQt6.QtGui import QAction
 
 from pa_hardware import (
@@ -16,12 +16,10 @@ from pa_hardware import (
     GalvoController, MockGalvoController,
     OscilloscopeController, MockOscilloscopeController,
     PicoScope5444DController, MockPicoScope5444DController,
-    TriggerController, MockTriggerController,
 )
 from .laser_widget import LaserWidget
 from .galvo_widget import GalvoWidget
 from .oscilloscope_widget import OscilloscopeWidget
-from .trigger_widget import TriggerWidget
 
 _SCOPE_NAMES = {
     "redpitaya": "Red Pitaya STEM 125-10",
@@ -36,10 +34,9 @@ class MainWindow(QMainWindow):
         self._scope_type = scope_type
 
         # Hardware instances
-        self._laser   = MockLaserController()   if mock else LaserController()
-        self._galvo   = MockGalvoController()   if mock else GalvoController()
-        self._scope   = self._make_scope(mock, scope_type)
-        self._trigger = MockTriggerController() if mock else TriggerController()
+        self._laser = MockLaserController() if mock else LaserController()
+        self._galvo = MockGalvoController() if mock else GalvoController()
+        self._scope = self._make_scope(mock, scope_type)
 
         scope_label = _SCOPE_NAMES.get(scope_type, scope_type)
         title = f"PA Setup Control — {scope_label}"
@@ -94,7 +91,6 @@ class MainWindow(QMainWindow):
         self._laser_widget = LaserWidget()
         self._laser_widget.power_changed.connect(self._on_laser_power)
         self._laser_widget.enable_changed.connect(self._on_laser_enable)
-        self._laser_widget.mode_changed.connect(self._on_laser_mode)
         layout.addWidget(self._laser_widget)
 
         self._galvo_widget = GalvoWidget()
@@ -102,18 +98,13 @@ class MainWindow(QMainWindow):
         self._galvo_widget.center_requested.connect(self._on_galvo_center)
         layout.addWidget(self._galvo_widget)
 
-        self._trigger_widget = TriggerWidget()
-        self._trigger_widget.start_requested.connect(self._on_trigger_start)
-        self._trigger_widget.stop_requested.connect(self._on_trigger_stop)
-        layout.addWidget(self._trigger_widget)
-
         layout.addWidget(self._build_log_panel())
         layout.addStretch()
 
         scroll = QScrollArea()
         scroll.setWidget(container)
         scroll.setWidgetResizable(True)
-        scroll.setMinimumWidth(280)
+        scroll.setMinimumWidth(500)
         scroll.setFrameShape(QScrollArea.Shape.NoFrame)
         return scroll
 
@@ -125,7 +116,7 @@ class MainWindow(QMainWindow):
         # Laser row
         laser_row = QHBoxLayout()
         laser_row.addWidget(QLabel("Laser port:"))
-        self._laser_port = QLineEdit("COM3")
+        self._laser_port = QLineEdit("/dev/ttyACM0")
         self._laser_port.setFixedWidth(70)
         laser_row.addWidget(self._laser_port)
         self._btn_laser_connect = QPushButton("Connect")
@@ -174,18 +165,6 @@ class MainWindow(QMainWindow):
         scope_row.addWidget(self._lbl_scope_status)
         layout.addLayout(scope_row)
 
-        # Trigger row
-        trigger_row = QHBoxLayout()
-        trigger_row.addStretch()
-        self._btn_trigger_connect = QPushButton("Connect Trigger")
-        self._btn_trigger_connect.setFixedWidth(115)
-        self._btn_trigger_connect.clicked.connect(self._on_trigger_connect)
-        trigger_row.addWidget(self._btn_trigger_connect)
-        self._lbl_trigger_status = QLabel("●")
-        self._lbl_trigger_status.setStyleSheet("color: gray;")
-        trigger_row.addWidget(self._lbl_trigger_status)
-        layout.addLayout(trigger_row)
-
         return group
 
     def _build_log_panel(self) -> QGroupBox:
@@ -231,9 +210,6 @@ class MainWindow(QMainWindow):
         self._set_status(self._lbl_galvo_status, True)
         self._galvo_widget.set_connected(True)
         self._set_status(self._lbl_scope_status, True)
-        self._trigger.connect("Dev1/ctr0")
-        self._set_status(self._lbl_trigger_status, True)
-        self._trigger_widget.set_connected(True)
 
     # ------------------------------------------------------------------
     # Connection slots
@@ -300,25 +276,6 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 self._log(f"Scope connection failed: {e}")
 
-    @pyqtSlot()
-    def _on_trigger_connect(self) -> None:
-        if self._trigger.is_connected:
-            self._trigger.disconnect()
-            self._set_status(self._lbl_trigger_status, False)
-            self._trigger_widget.set_connected(False)
-            self._btn_trigger_connect.setText("Connect Trigger")
-            self._log("Trigger disconnected.")
-        else:
-            channel = self._trigger_widget.channel()
-            try:
-                self._trigger.connect(channel)
-                self._set_status(self._lbl_trigger_status, True)
-                self._trigger_widget.set_connected(True)
-                self._btn_trigger_connect.setText("Disconnect Trigger")
-                self._log(f"Trigger connected on {channel}.")
-            except Exception as e:
-                self._log(f"Trigger connection failed: {e}")
-
     # ------------------------------------------------------------------
     # Laser slots
     # ------------------------------------------------------------------
@@ -340,14 +297,6 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self._log(f"Laser enable error: {e}")
 
-    @pyqtSlot(str)
-    def _on_laser_mode(self, mode: str) -> None:
-        try:
-            self._laser.set_modulation_mode(mode)
-            self._log(f"Laser mode → {mode}.")
-        except Exception as e:
-            self._log(f"Laser mode error: {e}")
-
     # ------------------------------------------------------------------
     # Galvo slots
     # ------------------------------------------------------------------
@@ -358,24 +307,6 @@ class MainWindow(QMainWindow):
             self._galvo.move_to(x_v, y_v)
         except Exception as e:
             self._log(f"Galvo move error: {e}")
-
-    @pyqtSlot(float, float)
-    def _on_trigger_start(self, freq_hz: float, duty: float) -> None:
-        try:
-            self._trigger.start(freq_hz, duty)
-            self._trigger_widget.set_running(True)
-            self._log(f"Trigger started: {freq_hz:.1f} Hz, duty {duty*100:.1f} %.")
-        except Exception as e:
-            self._log(f"Trigger start error: {e}")
-
-    @pyqtSlot()
-    def _on_trigger_stop(self) -> None:
-        try:
-            self._trigger.stop()
-            self._trigger_widget.set_running(False)
-            self._log("Trigger stopped.")
-        except Exception as e:
-            self._log(f"Trigger stop error: {e}")
 
     @pyqtSlot()
     def _on_galvo_center(self) -> None:
@@ -404,7 +335,7 @@ class MainWindow(QMainWindow):
             "PA Setup Control",
             f"Laser · Galvo · Oscilloscope control GUI\n\n"
             f"Instruments:\n"
-            f"  • Cobolt laser (serial)\n"
+            f"  • Cobolt laser (USB serial)\n"
             f"  • Thorlabs galvo mirrors (NI-DAQ)\n"
             f"  • {scope_label}",
         )
@@ -414,7 +345,7 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def closeEvent(self, event) -> None:
-        for dev in (self._trigger, self._laser, self._galvo, self._scope):
+        for dev in (self._laser, self._galvo, self._scope):
             try:
                 dev.disconnect()
             except Exception:
