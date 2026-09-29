@@ -5,6 +5,7 @@ from .oscilloscope import (
     PicoScope5444DController, MockPicoScope5444DController,
 )
 from .trigger import TriggerController, MockTriggerController
+from .stage import StageController, MockStageController
 
 __all__ = [
     "LaserController", "MockLaserController",
@@ -12,4 +13,5 @@ __all__ = [
     "OscilloscopeController", "MockOscilloscopeController",
     "PicoScope5444DController", "MockPicoScope5444DController",
     "TriggerController", "MockTriggerController",
+    "StageController", "MockStageController",
 ]

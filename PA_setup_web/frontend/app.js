@@ -200,12 +200,14 @@ async function connectLaser() {
     const port = document.getElementById('inp-laser-port').value;
     try {
         if (btn.dataset.connected === 'true') {
+            _stopLaserStatusPolling();
             await api('POST', '/api/laser/disconnect');
             setDot('dot-laser', false);
             btn.dataset.connected = 'false';
             btn.textContent = 'Connect';
             _setLaserEmission(false);
             _enableLaserControls(false);
+            _resetLaserStatusDisplay();
             log('Laser disconnected.');
         } else {
             await api('POST', '/api/laser/connect', { port });
@@ -213,6 +215,7 @@ async function connectLaser() {
             btn.dataset.connected = 'true';
             btn.textContent = 'Disconnect';
             _enableLaserControls(true);
+            _startLaserStatusPolling();
             log(`Laser connected on ${port}.`);
         }
     } catch (e) { log(`Laser: ${e.message}`); }
@@ -235,22 +238,94 @@ function _setLaserEmission(on) {
     btn.classList.toggle('active-green', on);
 }
 
-async function _sendLaserPower(mw) {
+async function _sendLaserRate(hz) {
     try {
-        await api('POST', '/api/laser/power', { power_mw: parseFloat(mw) });
+        await api('POST', '/api/laser/rate', { rate_hz: parseFloat(hz) });
     } catch (e) { log(`Laser: ${e.message}`); }
 }
 
 function _enableLaserControls(on) {
-    ['btn-laser-emit', 'sl-laser-power', 'inp-laser-power', 'sel-laser-mode']
+    ['btn-laser-emit', 'sl-laser-rate', 'inp-laser-rate', 'sel-laser-trigger', 'btn-laser-clear-fault']
         .forEach(id => { document.getElementById(id).disabled = !on; });
 }
 
-async function setLaserMode(mode) {
+async function setLaserTriggerSource(source) {
     try {
-        await api('POST', '/api/laser/mode', { mode });
-        log(`Laser mode → ${mode}.`);
+        await api('POST', '/api/laser/trigger_source', { source });
+        log(`Laser trigger source → ${source}.`);
     } catch (e) { log(`Laser: ${e.message}`); }
+}
+
+async function clearLaserFault() {
+    try {
+        await api('POST', '/api/laser/clear_fault');
+        log('Laser fault cleared.');
+        pollLaserStatus();
+    } catch (e) { log(`Laser: ${e.message}`); }
+}
+
+// ── Laser status polling ─────────────────────────────────────────────────────
+
+let _laserStatusIntervalId = null;
+
+function _startLaserStatusPolling() {
+    _stopLaserStatusPolling();
+    pollLaserStatus();
+    _laserStatusIntervalId = setInterval(pollLaserStatus, 2000);
+}
+
+function _stopLaserStatusPolling() {
+    if (_laserStatusIntervalId !== null) {
+        clearInterval(_laserStatusIntervalId);
+        _laserStatusIntervalId = null;
+    }
+}
+
+function _resetLaserStatusDisplay() {
+    document.getElementById('lbl-laser-actual').textContent = '-- Hz';
+    document.getElementById('lbl-laser-ready').textContent = '--';
+    document.getElementById('lbl-laser-ready').style.color = '';
+    document.getElementById('lbl-laser-state').textContent = '--';
+    document.getElementById('lbl-laser-interlock').textContent = '--';
+    document.getElementById('lbl-laser-fault').textContent = '--';
+    document.getElementById('lbl-laser-autostart').textContent = '--';
+    document.getElementById('lbl-laser-leds').textContent = '--';
+    document.getElementById('lbl-laser-serial').textContent = '--';
+    document.getElementById('lbl-laser-hours').textContent = '--';
+}
+
+async function pollLaserStatus() {
+    try {
+        const s = await api('GET', '/api/laser/status');
+
+        document.getElementById('lbl-laser-actual').textContent =
+            `${s.repetition_rate_hz.toFixed(1)} Hz`;
+        _setLaserEmission(s.enabled);
+        document.getElementById('sel-laser-trigger').value = s.trigger_source;
+
+        const readyEl = document.getElementById('lbl-laser-ready');
+        readyEl.textContent = s.ready ? 'Ready' : 'Not ready';
+        readyEl.style.color = s.ready ? '#4CAF50' : '#E53935';
+
+        document.getElementById('lbl-laser-state').textContent = s.operating_state;
+
+        document.getElementById('lbl-laser-interlock').textContent =
+            s.interlock_open ? 'OPEN (blocked)' : 'Closed (OK)';
+
+        document.getElementById('lbl-laser-fault').textContent = s.fault;
+        document.getElementById('btn-laser-clear-fault').disabled =
+            s.fault.trim().toLowerCase() === 'no fault';
+
+        document.getElementById('lbl-laser-autostart').textContent = s.autostart_enabled ? 'Yes' : 'No';
+
+        const led = s.leds;
+        document.getElementById('lbl-laser-leds').textContent =
+            `Power: ${led.power_on ? 'ON' : 'off'}  Laser On: ${led.laser_on ? 'ON' : 'off'}  ` +
+            `Lock: ${led.laser_lock ? 'ON' : 'off'}  Error: ${led.error ? 'ON' : 'off'}`;
+
+        document.getElementById('lbl-laser-serial').textContent = s.serial_number || '--';
+        document.getElementById('lbl-laser-hours').textContent = `${s.operating_hours.toFixed(1)} h`;
+    } catch (e) { log(`Laser status: ${e.message}`); }
 }
 
 // ── Galvo ───────────────────────────────────────────────────────────────────
@@ -419,6 +494,7 @@ async function _autoConnectMock() {
     document.getElementById('btn-laser-connect').dataset.connected = 'true';
     document.getElementById('btn-laser-connect').textContent = 'Disconnect';
     _enableLaserControls(true);
+    _startLaserStatusPolling();
 
     await api('POST', '/api/galvo/connect', { x_channel: 'Dev1/ao0', y_channel: 'Dev1/ao1' });
     setDot('dot-galvo', true);
@@ -446,7 +522,7 @@ async function _autoConnectMock() {
 document.addEventListener('DOMContentLoaded', async () => {
     initPlot();
 
-    _bindSlider('sl-laser-power', 'inp-laser-power', 10,   _sendLaserPower);
+    _bindSlider('sl-laser-rate',  'inp-laser-rate',  1,    _sendLaserRate);
     _bindSlider('sl-galvo-x',     'inp-galvo-xv',    100,  _moveGalvo);
     _bindSlider('sl-galvo-y',     'inp-galvo-yv',    100,  _moveGalvo);
 

@@ -70,24 +70,43 @@
       <h2>Laser</h2>
       <div class="row">
         <button id="btn-laser-emit" data-on="false" disabled
+                title="On a CDRH unit, turning emission OFF requires physically cycling the key switch before it will turn back on — the command that does that (@cob1) can't re-arm emission on its own. Use Trigger source to pause/resume pulses without touching this."
                 onclick="toggleLaserEmission()">Emission OFF</button>
-        <span id="lbl-laser-actual" style="margin-left:auto;color:#888">-- mW</span>
-      </div>
-      <div class="row" style="margin-top:4px">
-        <label>Power</label>
-        <input type="range" id="sl-laser-power" min="0" max="2000" value="0" disabled>
-        <input type="number" id="inp-laser-power" min="0" max="200" step="0.1"
-               value="0" disabled>
-        <span style="color:var(--muted)">mW</span>
+        <span id="lbl-laser-actual" style="margin-left:auto;color:#888">-- Hz</span>
       </div>
       <div class="row" style="margin-top:2px">
-        <label>Mode</label>
-        <select id="sel-laser-mode" disabled onchange="setLaserMode(this.value)"
-                title="CW: continuous. External: fires on each TTL pulse from trigger output.&#10;Start the trigger before switching to External.">
-          <option value="cw">CW</option>
+        <span style="color:#E5A000;font-size:11px">⚠ Emission OFF requires a physical key cycle to resume on a CDRH unit.
+          Use Trigger source to pause/resume pulses instead.</span>
+      </div>
+      <div class="row" style="margin-top:4px">
+        <label>Rep. rate</label>
+        <input type="range" id="sl-laser-rate" min="0" max="1000" value="1000" disabled>
+        <input type="number" id="inp-laser-rate" min="0" max="1000" step="1"
+               value="1000" disabled>
+        <span style="color:var(--muted)">Hz</span>
+      </div>
+      <div class="row" style="margin-top:2px">
+        <label>Trigger</label>
+        <select id="sel-laser-trigger" disabled onchange="setLaserTriggerSource(this.value)"
+                title="Internal: laser's own clock, rate set at left.&#10;External: fires on each TTL pulse from the trigger output — start the trigger before switching.&#10;Gated: internal rate, gated by an external HIGH level.">
+          <option value="internal">Internal</option>
           <option value="external">External trigger</option>
+          <option value="gated">Gated</option>
         </select>
       </div>
+      <hr style="border-color:var(--muted);margin:8px 0">
+      <div class="row"><label>Ready</label><span id="lbl-laser-ready">--</span></div>
+      <div class="row"><label>State</label><span id="lbl-laser-state">--</span></div>
+      <div class="row"><label>Interlock</label><span id="lbl-laser-interlock">--</span></div>
+      <div class="row">
+        <label>Fault</label><span id="lbl-laser-fault">--</span>
+        <button id="btn-laser-clear-fault" disabled style="margin-left:auto"
+                onclick="clearLaserFault()">Clear Fault</button>
+      </div>
+      <div class="row"><label>Autostart</label><span id="lbl-laser-autostart">--</span></div>
+      <div class="row"><label>LEDs</label><span id="lbl-laser-leds">--</span></div>
+      <div class="row"><label>Serial #</label><span id="lbl-laser-serial">--</span></div>
+      <div class="row"><label>Op. hours</label><span id="lbl-laser-hours">--</span></div>
     </div>
 
     <!-- Galvo controls -->

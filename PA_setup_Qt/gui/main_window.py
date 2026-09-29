@@ -1,30 +1,67 @@
 """Main application window."""
 from __future__ import annotations
+import time
 from datetime import datetime
 
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
-    QScrollArea, QGroupBox, QLabel, QLineEdit,
-    QPushButton, QSplitter, QTextEdit,
+    QScrollArea, QGroupBox, QLabel, QLineEdit, QSpinBox,
+    QPushButton, QSplitter, QTextEdit, QTabWidget,
     QStatusBar, QMessageBox,
 )
-from PyQt6.QtCore import Qt, pyqtSlot
+from PyQt6.QtCore import Qt, pyqtSlot, QThread, QObject, pyqtSignal
 from PyQt6.QtGui import QAction
 
 from pa_hardware import (
     LaserController, MockLaserController,
-    GalvoController, MockGalvoController,
     OscilloscopeController, MockOscilloscopeController,
     PicoScope5444DController, MockPicoScope5444DController,
+    StageController, MockStageController,
 )
 from .laser_widget import LaserWidget
-from .galvo_widget import GalvoWidget
 from .oscilloscope_widget import OscilloscopeWidget
+from .scan_widget import ScanWidget
 
 _SCOPE_NAMES = {
     "redpitaya": "Red Pitaya STEM 125-10",
     "picoscope": "PicoScope 5444D MSO",
 }
+
+
+class _LaserStatusWorker(QObject):
+    """Polls LaserController.get_status() on a background thread — each poll
+    is several serial round-trips (pycobolt rate-limits to ~100 ms apart), so
+    running it on the UI thread would visibly stall the GUI."""
+
+    status_ready = pyqtSignal(dict)
+    error = pyqtSignal(str)
+    finished = pyqtSignal()
+
+    def __init__(self, laser, poll_interval_s: float = 2.0):
+        super().__init__()
+        self._laser = laser
+        self._interval = poll_interval_s
+        # Set here, not in run(): stop() may be called before the thread's
+        # event loop actually dispatches run(), and run() must not clobber it.
+        self._running = True
+
+    @pyqtSlot()
+    def run(self):
+        while self._running:
+            try:
+                status = self._laser.get_status()
+                self.status_ready.emit(status)
+            except Exception as exc:
+                self.error.emit(str(exc))
+                break
+            elapsed = 0.0
+            while self._running and elapsed < self._interval:
+                time.sleep(0.1)
+                elapsed += 0.1
+        self.finished.emit()
+
+    def stop(self):
+        self._running = False
 
 
 class MainWindow(QMainWindow):
@@ -35,8 +72,11 @@ class MainWindow(QMainWindow):
 
         # Hardware instances
         self._laser = MockLaserController() if mock else LaserController()
-        self._galvo = MockGalvoController() if mock else GalvoController()
+        self._stage = MockStageController() if mock else StageController()
         self._scope = self._make_scope(mock, scope_type)
+
+        self._laser_status_thread: QThread | None = None
+        self._laser_status_worker: _LaserStatusWorker | None = None
 
         scope_label = _SCOPE_NAMES.get(scope_type, scope_type)
         title = f"PA Setup Control — {scope_label}"
@@ -68,8 +108,12 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(6, 6, 6, 6)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        # Built right-panel-first so self._scope_widget (and its
+        # axis_controls) exists before _build_left_panel places it there —
+        # splitter.addWidget order below still controls the visual layout.
+        right_panel = self._build_right_panel()
         splitter.addWidget(self._build_left_panel())
-        splitter.addWidget(self._build_right_panel())
+        splitter.addWidget(right_panel)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([320, 780])
@@ -89,14 +133,15 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._build_connection_group())
 
         self._laser_widget = LaserWidget()
-        self._laser_widget.power_changed.connect(self._on_laser_power)
+        self._laser_widget.trigger_source_changed.connect(self._on_laser_trigger_source)
+        self._laser_widget.rate_changed.connect(self._on_laser_rate)
         self._laser_widget.enable_changed.connect(self._on_laser_enable)
+        self._laser_widget.clear_fault_requested.connect(self._on_laser_clear_fault)
         layout.addWidget(self._laser_widget)
 
-        self._galvo_widget = GalvoWidget()
-        self._galvo_widget.position_changed.connect(self._on_galvo_move)
-        self._galvo_widget.center_requested.connect(self._on_galvo_center)
-        layout.addWidget(self._galvo_widget)
+        # Scope's axis controls live here rather than in the (already
+        # crowded) scope panel on the right — there's more room on this side.
+        layout.addWidget(self._scope_widget.axis_controls)
 
         layout.addWidget(self._build_log_panel())
         layout.addStretch()
@@ -128,28 +173,26 @@ class MainWindow(QMainWindow):
         laser_row.addWidget(self._lbl_laser_status)
         layout.addLayout(laser_row)
 
-        # Galvo row
-        galvo_row = QHBoxLayout()
-        galvo_row.addWidget(QLabel("X ch:"))
-        self._galvo_x_ch = QLineEdit("Dev1/ao0")
-        self._galvo_x_ch.setFixedWidth(80)
-        galvo_row.addWidget(self._galvo_x_ch)
-        galvo_row.addWidget(QLabel("Y:"))
-        self._galvo_y_ch = QLineEdit("Dev1/ao1")
-        self._galvo_y_ch.setFixedWidth(80)
-        galvo_row.addWidget(self._galvo_y_ch)
-        layout.addLayout(galvo_row)
-
-        galvo_btn_row = QHBoxLayout()
-        galvo_btn_row.addStretch()
-        self._btn_galvo_connect = QPushButton("Connect Galvo")
-        self._btn_galvo_connect.setFixedWidth(110)
-        self._btn_galvo_connect.clicked.connect(self._on_galvo_connect)
-        galvo_btn_row.addWidget(self._btn_galvo_connect)
-        self._lbl_galvo_status = QLabel("●")
-        self._lbl_galvo_status.setStyleSheet("color: gray;")
-        galvo_btn_row.addWidget(self._lbl_galvo_status)
-        layout.addLayout(galvo_btn_row)
+        # Stage row
+        stage_row = QHBoxLayout()
+        stage_row.addWidget(QLabel("Stage port:"))
+        self._stage_port = QLineEdit("/dev/ttyUSB0")
+        self._stage_port.setFixedWidth(70)
+        stage_row.addWidget(self._stage_port)
+        stage_row.addWidget(QLabel("Addr:"))
+        self._stage_address = QSpinBox()
+        self._stage_address.setRange(1, 99)
+        self._stage_address.setValue(2)
+        self._stage_address.setFixedWidth(45)
+        stage_row.addWidget(self._stage_address)
+        self._btn_stage_connect = QPushButton("Connect")
+        self._btn_stage_connect.setFixedWidth(80)
+        self._btn_stage_connect.clicked.connect(self._on_stage_connect)
+        stage_row.addWidget(self._btn_stage_connect)
+        self._lbl_stage_status = QLabel("●")
+        self._lbl_stage_status.setStyleSheet("color: gray;")
+        stage_row.addWidget(self._lbl_stage_status)
+        layout.addLayout(stage_row)
 
         # Scope row — label shows which model is configured
         scope_row = QHBoxLayout()
@@ -184,7 +227,14 @@ class MainWindow(QMainWindow):
 
         self._scope_widget = OscilloscopeWidget(self._scope)
         self._scope_widget.log_message.connect(self._log)
-        layout.addWidget(self._scope_widget)
+
+        self._scan_widget = ScanWidget(self._stage, self._scope, self._scope_widget)
+        self._scan_widget.log_message.connect(self._log)
+
+        tabs = QTabWidget()
+        tabs.addTab(self._scope_widget, "Oscilloscope")
+        tabs.addTab(self._scan_widget, "Scan")
+        layout.addWidget(tabs)
         return panel
 
     def _setup_menu(self) -> None:
@@ -207,8 +257,10 @@ class MainWindow(QMainWindow):
     def _auto_connect_mock(self) -> None:
         self._set_status(self._lbl_laser_status, True)
         self._laser_widget.set_connected(True)
-        self._set_status(self._lbl_galvo_status, True)
-        self._galvo_widget.set_connected(True)
+        self._start_laser_status_polling()
+        self._stage.connect(self._stage_port.text(), address=self._stage_address.value())
+        self._set_status(self._lbl_stage_status, True)
+        self._btn_stage_connect.setText("Disconnect")
         self._set_status(self._lbl_scope_status, True)
 
     # ------------------------------------------------------------------
@@ -218,6 +270,7 @@ class MainWindow(QMainWindow):
     @pyqtSlot()
     def _on_laser_connect(self) -> None:
         if self._laser.is_connected:
+            self._stop_laser_status_polling()
             self._laser.disconnect()
             self._set_status(self._lbl_laser_status, False)
             self._laser_widget.set_connected(False)
@@ -230,32 +283,31 @@ class MainWindow(QMainWindow):
                 self._laser_widget.set_connected(True)
                 self._btn_laser_connect.setText("Disconnect")
                 self._log(f"Laser connected on {self._laser_port.text()}.")
+                self._start_laser_status_polling()
             except Exception as e:
                 self._log(f"Laser connection failed: {e}")
 
     @pyqtSlot()
-    def _on_galvo_connect(self) -> None:
-        if self._galvo.is_connected:
-            self._galvo.disconnect()
-            self._set_status(self._lbl_galvo_status, False)
-            self._galvo_widget.set_connected(False)
-            self._btn_galvo_connect.setText("Connect Galvo")
-            self._log("Galvo disconnected.")
+    def _on_stage_connect(self) -> None:
+        if self._stage.is_connected:
+            self._stage.disconnect()
+            self._set_status(self._lbl_stage_status, False)
+            self._btn_stage_connect.setText("Connect")
+            self._log("Stage disconnected.")
         else:
             try:
-                self._galvo.connect(
-                    self._galvo_x_ch.text(),
-                    self._galvo_y_ch.text(),
+                self._stage.connect(
+                    self._stage_port.text(),
+                    address=self._stage_address.value(),
                 )
-                self._set_status(self._lbl_galvo_status, True)
-                self._galvo_widget.set_connected(True)
-                self._btn_galvo_connect.setText("Disconnect Galvo")
+                self._set_status(self._lbl_stage_status, True)
+                self._btn_stage_connect.setText("Disconnect")
                 self._log(
-                    f"Galvo connected (X={self._galvo_x_ch.text()}, "
-                    f"Y={self._galvo_y_ch.text()})."
+                    f"Stage connected on {self._stage_port.text()} "
+                    f"(address {self._stage_address.value()})."
                 )
             except Exception as e:
-                self._log(f"Galvo connection failed: {e}")
+                self._log(f"Stage connection failed: {e}")
 
     @pyqtSlot()
     def _on_scope_connect(self) -> None:
@@ -277,15 +329,71 @@ class MainWindow(QMainWindow):
                 self._log(f"Scope connection failed: {e}")
 
     # ------------------------------------------------------------------
+    # Laser status polling
+    # ------------------------------------------------------------------
+
+    def _start_laser_status_polling(self) -> None:
+        self._stop_laser_status_polling()
+        self._laser_status_thread = QThread()
+        self._laser_status_worker = _LaserStatusWorker(self._laser)
+        self._laser_status_worker.moveToThread(self._laser_status_thread)
+        self._laser_status_thread.started.connect(self._laser_status_worker.run)
+        self._laser_status_worker.status_ready.connect(self._on_laser_status)
+        self._laser_status_worker.error.connect(self._on_laser_status_error)
+        self._laser_status_worker.finished.connect(self._laser_status_thread.quit)
+        self._laser_status_thread.start()
+
+    def _stop_laser_status_polling(self) -> None:
+        if self._laser_status_worker is not None:
+            self._laser_status_worker.stop()
+        if self._laser_status_thread is not None:
+            self._laser_status_thread.quit()
+            if not self._laser_status_thread.wait(2000):
+                # Still running — stop() only takes effect on the next loop
+                # iteration, but get_status() is several sequential blocking
+                # serial round-trips that can still be in flight. Wait for
+                # real completion instead of dropping the QThread reference
+                # while its OS thread is still alive (crashes as "QThread:
+                # Destroyed while thread is still running").
+                self._laser_status_thread.wait()
+        self._laser_status_thread = None
+        self._laser_status_worker = None
+
+    @pyqtSlot(dict)
+    def _on_laser_status(self, status: dict) -> None:
+        self._laser_widget.update_status(status)
+
+    @pyqtSlot(str)
+    def _on_laser_status_error(self, message: str) -> None:
+        self._log(f"Laser status polling error: {message}")
+        self._stop_laser_status_polling()
+
+    # ------------------------------------------------------------------
     # Laser slots
     # ------------------------------------------------------------------
 
-    @pyqtSlot(float)
-    def _on_laser_power(self, mw: float) -> None:
+    @pyqtSlot()
+    def _on_laser_clear_fault(self) -> None:
         try:
-            self._laser.set_power(mw)
+            self._laser.clear_fault()
+            self._log("Laser fault cleared.")
         except Exception as e:
-            self._log(f"Laser set_power error: {e}")
+            self._log(f"Laser clear_fault error: {e}")
+
+    @pyqtSlot(str)
+    def _on_laser_trigger_source(self, source: str) -> None:
+        try:
+            self._laser.set_trigger_source(source)
+            self._log(f"Laser trigger source set to {source}.")
+        except Exception as e:
+            self._log(f"Laser set_trigger_source error: {e}")
+
+    @pyqtSlot(float)
+    def _on_laser_rate(self, rate_hz: float) -> None:
+        try:
+            self._laser.set_internal_rate(rate_hz)
+        except Exception as e:
+            self._log(f"Laser set_internal_rate error: {e}")
 
     @pyqtSlot(bool)
     def _on_laser_enable(self, enabled: bool) -> None:
@@ -296,25 +404,6 @@ class MainWindow(QMainWindow):
             self._status_bar.showMessage(f"Laser {state}")
         except Exception as e:
             self._log(f"Laser enable error: {e}")
-
-    # ------------------------------------------------------------------
-    # Galvo slots
-    # ------------------------------------------------------------------
-
-    @pyqtSlot(float, float)
-    def _on_galvo_move(self, x_v: float, y_v: float) -> None:
-        try:
-            self._galvo.move_to(x_v, y_v)
-        except Exception as e:
-            self._log(f"Galvo move error: {e}")
-
-    @pyqtSlot()
-    def _on_galvo_center(self) -> None:
-        try:
-            self._galvo.center()
-            self._log("Galvo centered.")
-        except Exception as e:
-            self._log(f"Galvo center error: {e}")
 
     # ------------------------------------------------------------------
     # Helpers
@@ -333,10 +422,10 @@ class MainWindow(QMainWindow):
         QMessageBox.about(
             self,
             "PA Setup Control",
-            f"Laser · Galvo · Oscilloscope control GUI\n\n"
+            f"Laser · Stage · Oscilloscope control GUI\n\n"
             f"Instruments:\n"
             f"  • Cobolt laser (USB serial)\n"
-            f"  • Thorlabs galvo mirrors (NI-DAQ)\n"
+            f"  • Zaber T-LLS105 translation stage (USB serial)\n"
             f"  • {scope_label}",
         )
 
@@ -345,7 +434,9 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def closeEvent(self, event) -> None:
-        for dev in (self._laser, self._galvo, self._scope):
+        self._stop_laser_status_polling()
+        self._scan_widget.shutdown()
+        for dev in (self._laser, self._stage, self._scope):
             try:
                 dev.disconnect()
             except Exception:

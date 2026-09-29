@@ -71,8 +71,8 @@ app.mount("/static", StaticFiles(directory=FRONTEND), name="static")
 class LaserConnectReq(BaseModel):
     port: str
 
-class LaserPowerReq(BaseModel):
-    power_mw: float
+class LaserRateReq(BaseModel):
+    rate_hz: float
 
 class LaserEnableReq(BaseModel):
     enabled: bool
@@ -97,8 +97,8 @@ class TriggerStartReq(BaseModel):
     freq_hz: float = 1000.0
     duty_cycle: float = 0.05
 
-class LaserModeReq(BaseModel):
-    mode: str   # 'cw' or 'external'
+class LaserTriggerSourceReq(BaseModel):
+    source: str   # 'internal', 'external', or 'gated'
 
 
 # ---------------------------------------------------------------------------
@@ -129,9 +129,9 @@ async def laser_status():
     return await asyncio.to_thread(_laser.get_status)
 
 
-@app.post("/api/laser/power")
-async def laser_power(req: LaserPowerReq):
-    await asyncio.to_thread(_laser.set_power, req.power_mw)
+@app.post("/api/laser/rate")
+async def laser_rate(req: LaserRateReq):
+    await asyncio.to_thread(_laser.set_internal_rate, req.rate_hz)
     return {"ok": True}
 
 
@@ -141,9 +141,15 @@ async def laser_enable(req: LaserEnableReq):
     return {"ok": True}
 
 
-@app.post("/api/laser/mode")
-async def laser_mode(req: LaserModeReq):
-    await asyncio.to_thread(_laser.set_modulation_mode, req.mode)
+@app.post("/api/laser/trigger_source")
+async def laser_trigger_source(req: LaserTriggerSourceReq):
+    await asyncio.to_thread(_laser.set_trigger_source, req.source)
+    return {"ok": True}
+
+
+@app.post("/api/laser/clear_fault")
+async def laser_clear_fault():
+    await asyncio.to_thread(_laser.clear_fault)
     return {"ok": True}
 
 
@@ -267,6 +273,11 @@ async def scope_ws(ws: WebSocket):
                     cfg["duration_ms"],
                     cfg.get("trigger_mv", 0.0),
                 )
+                if len(v) == 0:
+                    # No genuine trigger this cycle (Normal-mode semantics —
+                    # see capture_block); skip the frame so the browser plot
+                    # holds the last real trace instead of flashing empty.
+                    continue
                 await ws.send_bytes(_pack_frame(t, v))
             except WebSocketDisconnect:
                 stop_evt.set()

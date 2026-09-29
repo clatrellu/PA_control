@@ -1,12 +1,17 @@
 """Entry point — run with: uv run python main.py [--mock] [--scope {redpitaya,picoscope}]"""
 import sys
 import argparse
+#import logging
 
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtGui import QPalette, QColor
 from PyQt6.QtCore import Qt
 
 from gui.main_window import MainWindow
+
+# Temporary diagnostic logging — checking capture timing after the
+# TCP_QUICKACK fix. Remove once confirmed.
+#logging.basicConfig(level=logging.DEBUG, format="%(message)s")
 
 
 def _apply_dark_palette(app: QApplication) -> None:

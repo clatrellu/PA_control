@@ -9,8 +9,8 @@ class TriggerController:
     modulation/trigger input. Default output terminal for ctr0 varies by
     device (e.g. PFI12 on USB-6211, PFI4 on USB-6361) — check NI-MAX.
 
-    The laser must also be placed in digital-modulation mode; use
-    LaserController.set_modulation_mode('external') before calling start().
+    The laser must also be set to accept the external trigger; use
+    LaserController.set_trigger_source('external') before calling start().
     """
 
     def __init__(self):

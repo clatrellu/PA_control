@@ -1,9 +1,16 @@
 """Oscilloscope controllers: Red Pitaya STEM 125-10 and PicoScope 5444D MSO."""
 from __future__ import annotations
+import logging
 import socket
 import time
 from typing import Any
 import numpy as np
+
+_log = logging.getLogger(__name__)
+
+# Linux-only socket option; guarded since this runs cross-platform (the Qt
+# app has been run from Windows in this project too).
+_HAS_QUICKACK = hasattr(socket, "TCP_QUICKACK")
 
 # ---------------------------------------------------------------------------
 # Red Pitaya STEM 125-10
@@ -38,6 +45,22 @@ RP_DEFAULT_IP ="192.168.1.100"
  #"169.254.127.245"
 
 
+def _parse_voltage_data(raw: str) -> np.ndarray:
+    """Parse a Red Pitaya SCPI data response like '{v0,v1,...}' into a float array.
+
+    Returns an empty array rather than raising if the response is malformed
+    (e.g. an 'ERR!-3' error string), so callers never see a ValueError. The
+    raw response is logged so a malformed reply (buffer read racing the
+    acquisition, dropped bytes) is distinguishable from a genuinely missed
+    trigger instead of both looking like silent "no signal" frames.
+    """
+    try:
+        return np.fromstring(raw.strip("{}"), sep=",", dtype=float)
+    except ValueError:
+        _log.warning("Red Pitaya: malformed data response, dropping frame: %r", raw)
+        return np.array([], dtype=float)
+
+
 def _rate_to_decimation(rate_hz: float) -> int:
     """Return the smallest integer decimation that achieves >= rate_hz (clamped 1–65536)."""
     return max(1, min(65536, round(_RP_CLOCK_HZ / rate_hz)))
@@ -54,6 +77,7 @@ class OscilloscopeController:
     COUPLING_LABELS = COUPLING_LABELS
     RANGE_LABELS = RANGE_LABELS
     SAMPLE_RATES = RP_SAMPLE_RATES
+    MAX_SAMPLES = _BUFFER_SIZE  # hardware acquisition buffer depth
 
     def __init__(self, ip: str = RP_DEFAULT_IP, port: int = 5000, timeout: float = 10.0):
         self._ip = ip
@@ -63,6 +87,23 @@ class OscilloscopeController:
         self._channel = "CH1"
         self._coupling = "DC"
         self._range = "1 V"
+        # Cache of the (sample_rate_hz, duration_ms, trigger_mv, pretrigger_ms)
+        # last sent to the FPGA via _configure_acquisition, so repeat
+        # capture_block calls with unchanged params (the common case in a
+        # continuous streaming loop) skip the RST/GAIN/DEC/TRIG:LEV/TRIG:DLY
+        # round-trips and only pay for arming the trigger and reading data.
+        # See capture_block.
+        self._armed_params: tuple[float, float, float, float] | None = None
+        self._decimation = 1
+        self._actual_rate = _RP_CLOCK_HZ
+        self._n_samples = 0
+        self._n_pretrigger = 0
+        # Trigger source channel, independent of the data channel above —
+        # e.g. a laser sync pulse wired into CH2 while CH1 is recorded.
+        # None means "trigger on the data channel itself" (the old behavior).
+        self._trigger_channel: str | None = None
+        self._trigger_range = "20 V"
+        self._trigger_edge = "rising"  # "rising" or "falling"
 
     # ------------------------------------------------------------------
     # SCPI transport
@@ -70,9 +111,24 @@ class OscilloscopeController:
 
     def _send(self, cmd: str) -> None:
         assert self._sock is not None, "Not connected"
+        _log.debug("Red Pitaya <- %s", cmd)
         self._sock.sendall((cmd + "\r\n").encode())
 
-    def _recv(self) -> str:
+    def _recv(self, bulk: bool = False) -> str:
+        """Read one SCPI reply, terminated by \\r\\n.
+
+        bulk selects how TCP_QUICKACK is used, per hardware measurements:
+        the Red Pitaya's SCPI server has a ~40ms per-command stall unless we
+        force an immediate ACK (delayed ACK interacting with the server's
+        own Nagle-serialized send queue, best guess) — re-applying
+        TCP_QUICKACK after every chunk fixes this and is ~40-90x faster for
+        small, single-chunk replies (bulk=False, the default — status
+        queries, TPOS, etc.). But doing that on every chunk of a large,
+        multi-chunk reply (a DATA:STA:N? sample read) measured *slower*
+        overall than leaving it alone — likely fighting the TCP stack's
+        normal flow control for a longer transfer — so bulk=True (used for
+        DATA:STA:N?) skips the re-application entirely.
+        """
         assert self._sock is not None, "Not connected"
         buf = b""
         while not buf.endswith(b"\r\n"):
@@ -80,11 +136,15 @@ class OscilloscopeController:
             if not chunk:
                 break
             buf += chunk
-        return buf.decode().strip()
+            if _HAS_QUICKACK and not bulk:
+                self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_QUICKACK, 1)
+        reply = buf.decode().strip()
+        _log.debug("Red Pitaya -> %s", reply[:200])
+        return reply
 
-    def _ask(self, cmd: str) -> str:
+    def _ask(self, cmd: str, bulk: bool = False) -> str:
         self._send(cmd)
-        return self._recv()
+        return self._recv(bulk=bulk)
 
     # ------------------------------------------------------------------
     # Connection
@@ -92,10 +152,18 @@ class OscilloscopeController:
 
     def connect(self) -> None:
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # Disable Nagle's algorithm: this is a small-request/small-response
+        # protocol (every capture is many short SCPI round-trips), which is
+        # exactly the pattern that suffers a ~40ms stall per round-trip when
+        # Nagle interacts with the server's delayed-ACK timer. Measured on
+        # hardware: every command — even a trivial *IDN?/ACQ:TRIG:STAT? — was
+        # taking ~40-48ms with this left at its default (enabled).
+        self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self._sock.settimeout(self._timeout)
         self._sock.connect((self._ip, self._port))
         self._send("ACQ:RST")
         self._apply_channel_config()
+        self._armed_params = None
 
     def disconnect(self) -> None:
         if self._sock:
@@ -125,73 +193,190 @@ class OscilloscopeController:
         if self.is_connected:
             self._apply_channel_config()
 
+    def configure_trigger_channel(
+        self,
+        channel: str | None,
+        range_label: str = "20 V",
+        edge: str = "rising",
+    ) -> None:
+        """Set which channel the trigger fires on, independent of the data
+        channel set via configure_channel(). Pass None (the default) to
+        trigger on the data channel itself. Use this when the trigger source
+        is physically different from what's being recorded — e.g. a laser
+        sync pulse wired into CH2 while the transducer signal on CH1 is
+        captured.
+
+        edge selects "rising" (default) or "falling" — use "falling" when
+        the source pulses low (dips down) rather than high on the actual
+        event, e.g. some lasers' Signal Out drops on firing and recovers
+        afterward, so the physically meaningful edge is the fall, not the
+        rise back to baseline.
+        """
+        self._trigger_channel = channel
+        self._trigger_range = range_label
+        self._trigger_edge = edge
+        if self.is_connected:
+            self._apply_channel_config()
+
     def _apply_channel_config(self) -> None:
         ch = _CHANNELS[self._channel]
         gain, _ = _RANGES[self._range]
         self._send(f"ACQ:SOUR{ch}:GAIN {gain}")
+        if self._trigger_channel and self._trigger_channel != self._channel:
+            trig_ch = _CHANNELS[self._trigger_channel]
+            trig_gain, _ = _RANGES[self._trigger_range]
+            self._send(f"ACQ:SOUR{trig_ch}:GAIN {trig_gain}")
 
     # ------------------------------------------------------------------
     # Acquisition
     # ------------------------------------------------------------------
 
-    def capture_block(
+    def _configure_acquisition(
         self,
         sample_rate_hz: float,
         duration_ms: float,
-        trigger_mv: float = 0.0,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Triggered single-block capture.
+        trigger_mv: float,
+        pretrigger_ms: float,
+    ) -> None:
+        """Apply decimation, trigger level/delay, and reset — once per parameter set.
 
-        Returns (time_us, voltage_mv) as NumPy arrays.
+        capture_block only calls this when (sample_rate_hz, duration_ms,
+        trigger_mv, pretrigger_ms) differ from the last call. Re-sending
+        ACQ:RST and the rest on every single acquisition (the previous
+        behavior) added several blocking SCPI round-trips of dead time
+        *before* the trigger was even armed; with a free-running laser
+        trigger, pulses landing in that window were simply never seen, which
+        showed up as the signal being sporadically missing rather than
+        under-sampled.
         """
         decimation = _rate_to_decimation(sample_rate_hz)
         actual_rate = _RP_CLOCK_HZ / decimation
         n_samples = min(int(actual_rate * duration_ms / 1e3), _BUFFER_SIZE)
-        ch = _CHANNELS[self._channel]
+        # Split the requested window into pre/post-trigger portions. DLY is
+        # the number of samples kept *after* the trigger before acquisition
+        # stops — the rest of n_samples comes from before the trigger event,
+        # read by starting the buffer read earlier (see capture_block).
+        n_pretrigger = min(int(actual_rate * pretrigger_ms / 1e3), n_samples)
+        n_posttrigger = n_samples - n_pretrigger
         trig_v = trigger_mv / 1e3
 
         self._send("ACQ:RST")
         self._apply_channel_config()
         self._send(f"ACQ:DEC {decimation}")
         self._send(f"ACQ:TRIG:LEV {trig_v:.6f}")
-        # DLY = n_samples: capture exactly n_samples post-trigger before stopping
-        self._send(f"ACQ:TRIG:DLY {n_samples}")
+        self._send(f"ACQ:TRIG:DLY {n_posttrigger}")
+
+        self._decimation = decimation
+        self._actual_rate = actual_rate
+        self._n_samples = n_samples
+        self._n_pretrigger = n_pretrigger
+        self._armed_params = (sample_rate_hz, duration_ms, trigger_mv, pretrigger_ms)
+
+    def capture_block(
+        self,
+        sample_rate_hz: float,
+        duration_ms: float,
+        trigger_mv: float = 0.0,
+        pretrigger_ms: float = 0.0,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Triggered single-block capture.
+
+        pretrigger_ms is how much of duration_ms should come from *before*
+        the trigger event (clamped to duration_ms); the rest is post-trigger.
+        In the returned time_us, 0 marks the trigger event itself, so
+        pre-trigger samples come back with negative timestamps.
+
+        Returns (time_us, voltage_mv) as NumPy arrays.
+        """
+        params = (sample_rate_hz, duration_ms, trigger_mv, pretrigger_ms)
+        if self._armed_params != params:
+            self._configure_acquisition(*params)
+
+        n_samples = self._n_samples
+        n_pretrigger = self._n_pretrigger
+        actual_rate = self._actual_rate
+        ch = _CHANNELS[self._channel]
+        trig_ch = _CHANNELS[self._trigger_channel] if self._trigger_channel else ch
+
+        t_arm_start = time.monotonic()
         self._send("ACQ:START")
 
         if trigger_mv == 0.0:
-            # Immediate capture — no edge detection, always returns data
+            # Immediate capture: force the trigger right away.
             self._send("ACQ:TRIG NOW")
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                if self._ask("ACQ:TRIG:STAT?") == "TD":
+                    break
+                time.sleep(0.005)
         else:
-            # Wait for rising edge at the requested threshold (max 5 s)
-            self._send(f"ACQ:TRIG CH{ch}_PE")
+            # Wait for a genuine edge (rising or falling, per
+            # self._trigger_edge) at the requested threshold (up to 5 s) —
+            # "Normal" trigger mode. Unlike the old behavior, a timeout here
+            # does NOT force ACQ:TRIG NOW: forcing a capture off a real
+            # trigger source fabricates a frame from whatever noise happens to
+            # be in the buffer, which is "Auto" trigger mode and was the
+            # actual cause of the sporadic-signal symptom — on cycles where
+            # the real transducer pulse didn't cross the threshold, the forced
+            # capture returned noise that looked like a missing signal. On
+            # timeout we just report no data for this cycle so the caller can
+            # hold the last real trace instead (see server.py's _capture_loop).
+            edge_suffix = "PE" if self._trigger_edge == "rising" else "NE"
+            self._send(f"ACQ:TRIG CH{trig_ch}_{edge_suffix}")
             deadline = time.monotonic() + 5.0
             while time.monotonic() < deadline:
                 if self._ask("ACQ:TRIG:STAT?") == "TD":
                     break
                 time.sleep(0.005)
             else:
-                raise TimeoutError("Red Pitaya: trigger not detected within 5 s")
+                return np.array([]), np.array([])
 
-        # Wait for post-trigger samples to fill at actual_rate
+        t_triggered = time.monotonic()
         time.sleep(n_samples / actual_rate + 0.005)
+        t_settled = time.monotonic()
 
-        # Read data from trigger position, handling circular buffer wrap-around
-        trig_pos = int(self._ask("ACQ:TRIG:POS?"))
-        if trig_pos + n_samples <= _BUFFER_SIZE:
-            raw = self._ask(f"ACQ:SOUR{ch}:DATA:STA:N? {trig_pos},{n_samples}")
-            voltage_v = np.fromstring(raw.strip("{}"), sep=",", dtype=float)
-        else:
-            n1 = _BUFFER_SIZE - trig_pos
-            n2 = n_samples - n1
-            r1 = self._ask(f"ACQ:SOUR{ch}:DATA:STA:N? {trig_pos},{n1}")
-            r2 = self._ask(f"ACQ:SOUR{ch}:DATA:STA:N? 0,{n2}")
-            v1 = np.fromstring(r1.strip("{}"), sep=",", dtype=float)
-            v2 = np.fromstring(r2.strip("{}"), sep=",", dtype=float)
-            voltage_v = np.concatenate([v1, v2])
+        # ACQ:TRIG:POS? goes unanswered on current firmware (REDPITAYA,
+        # INSTR2025,,01-21) — confirmed by probing the SCPI server directly,
+        # it silently drops the command instead of replying, which hung this
+        # read until the socket timeout. ACQ:TPOS? is the live equivalent.
+        # Still guarded by the fallback in case of a malformed reply.
+        try:
+            trig_pos = int(self._ask("ACQ:TPOS?"))
+        except ValueError:
+            trig_pos = 0
+
+        # Start reading n_pretrigger samples before the trigger position
+        # (wrapping through address 0 via modulo, same circular buffer
+        # _read_samples already handles wrapping forward past the end of).
+        start_pos = (trig_pos - n_pretrigger) % _BUFFER_SIZE
+        voltage_v = self._read_samples(ch, start_pos, n_samples)
+        t_read = time.monotonic()
+
+        _log.debug(
+            "capture_block timing: arm+trigger-wait=%.1fms  settle-sleep=%.1fms  "
+            "TPOS+data-read=%.1fms  (n_samples=%d)",
+            (t_triggered - t_arm_start) * 1e3,
+            (t_settled - t_triggered) * 1e3,
+            (t_read - t_settled) * 1e3,
+            n_samples,
+        )
 
         n = len(voltage_v)
-        time_us = np.arange(n) / actual_rate * 1e6
+        # Index n_pretrigger is the trigger event itself — t=0 — so
+        # pre-trigger samples come back with negative timestamps.
+        time_us = (np.arange(n) - n_pretrigger) / actual_rate * 1e6
         return time_us, voltage_v * 1e3
+
+    def _read_samples(self, ch: int, trig_pos: int, n_samples: int) -> np.ndarray:
+        """Read n_samples from the circular buffer starting at trig_pos, handling wrap-around."""
+        if trig_pos + n_samples <= _BUFFER_SIZE:
+            raw = self._ask(f"ACQ:SOUR{ch}:DATA:STA:N? {trig_pos},{n_samples}", bulk=True)
+            return _parse_voltage_data(raw)
+        n1 = _BUFFER_SIZE - trig_pos
+        n2 = n_samples - n1
+        r1 = self._ask(f"ACQ:SOUR{ch}:DATA:STA:N? {trig_pos},{n1}", bulk=True)
+        r2 = self._ask(f"ACQ:SOUR{ch}:DATA:STA:N? 0,{n2}", bulk=True)
+        return np.concatenate([_parse_voltage_data(r1), _parse_voltage_data(r2)])
 
 
 class MockOscilloscopeController:
@@ -201,6 +386,7 @@ class MockOscilloscopeController:
     COUPLING_LABELS = COUPLING_LABELS
     RANGE_LABELS = RANGE_LABELS
     SAMPLE_RATES = RP_SAMPLE_RATES
+    MAX_SAMPLES = _BUFFER_SIZE
 
     def __init__(self):
         self._channel = "CH1"
@@ -222,22 +408,33 @@ class MockOscilloscopeController:
         self._channel = channel
         self._range = range_label
 
+    def configure_trigger_channel(
+        self, channel: str | None, range_label: str = "20 V", edge: str = "rising"
+    ) -> None:
+        pass  # simulated capture ignores trigger source entirely
+
     def capture_block(
         self,
         sample_rate_hz: float,
         duration_ms: float,
         trigger_mv: float = 0.0,
+        pretrigger_ms: float = 0.0,
     ) -> tuple[np.ndarray, np.ndarray]:
         n = int(sample_rate_hz * duration_ms / 1e3)
-        t_us = np.linspace(0, duration_ms * 1e3, n)
+        pretrigger_ms = min(pretrigger_ms, duration_ms)
+        t_us = np.linspace(-pretrigger_ms * 1e3, (duration_ms - pretrigger_ms) * 1e3, n)
 
-        # ~10 MHz damped sinusoid (photoacoustic-like) + Gaussian noise
+        # ~10 MHz damped sinusoid (photoacoustic-like) + Gaussian noise.
+        # Only post-trigger (t >= 0) carries the simulated pulse — before the
+        # trigger there's nothing but baseline noise, same as a real capture.
         freq_hz = 10e6
         decay_us = duration_ms * 100
+        t_post = np.clip(t_us, 0, None)
         signal = (
             120.0
-            * np.exp(-t_us / decay_us)
-            * np.sin(2 * np.pi * freq_hz * t_us / 1e6)
+            * np.exp(-t_post / decay_us)
+            * np.sin(2 * np.pi * freq_hz * t_post / 1e6)
+            * (t_us >= 0)
         )
         noise = self._rng.normal(0, 8, n)
         return t_us, signal + noise
@@ -271,6 +468,11 @@ _PICO_RANGES: dict[str, tuple[int, float]] = {
 # 12-bit resolution (PS5000A_DR_12BIT = 1); max ADC value for ps5000a
 _PICO_RESOLUTION: int = 1
 _PICO_MAX_ADC: int = 32512
+
+# The 5444D's actual buffer depth depends on resolution/timebase (queried live
+# via ps5000aGetTimebase2 in capture_block); this is just a sane upper bound
+# used both as a safety cap there and as the advertised MAX_SAMPLES below.
+_PICO_MAX_SAMPLES: int = 10_000_000
 
 PICO_CHANNEL_LABELS = list(_PICO_CHANNELS.keys())
 PICO_COUPLING_LABELS = list(_PICO_COUPLINGS.keys())
@@ -311,6 +513,7 @@ class PicoScope5444DController:
     COUPLING_LABELS = PICO_COUPLING_LABELS
     RANGE_LABELS = PICO_RANGE_LABELS
     SAMPLE_RATES = PICO_SAMPLE_RATES
+    MAX_SAMPLES = _PICO_MAX_SAMPLES
 
     def __init__(self) -> None:
         import ctypes
@@ -318,6 +521,7 @@ class PicoScope5444DController:
         self._channel = "A"
         self._coupling = "DC"
         self._range = "1 V"
+        self._trigger_edge = "rising"  # "rising" or "falling"
         self._connected = False
         self._ps: Any = None  # ps5000a module, assigned on connect
 
@@ -379,6 +583,32 @@ class PicoScope5444DController:
         if self._connected:
             self._apply_channel_config()
 
+    def configure_trigger_channel(
+        self,
+        channel: str | None,
+        range_label: str = "20 V",
+        edge: str = "rising",
+    ) -> None:
+        """Set the channel the trigger fires on, independent of the data
+        channel — see OscilloscopeController.configure_trigger_channel.
+
+        Only channel=None (trigger on the data channel itself, the default)
+        is supported here: a genuinely separate trigger channel needs that
+        channel enabled in _apply_channel_config's ps5000aSetChannel loop and
+        its own range passed into ps5000aSetSimpleTrigger's threshold
+        conversion, and this hasn't been exercised against real 5444D
+        hardware, so it's refused rather than silently doing the wrong thing.
+
+        edge ("rising" or "falling") is supported regardless — it's just the
+        ps5000aSetSimpleTrigger direction argument, independent of channel.
+        """
+        if channel is not None and channel != self._channel:
+            raise NotImplementedError(
+                "PicoScope5444DController: a trigger channel separate from "
+                "the data channel isn't implemented yet"
+            )
+        self._trigger_edge = edge
+
     def _apply_channel_config(self) -> None:
         from picosdk.functions import assert_pico_ok
 
@@ -400,8 +630,14 @@ class PicoScope5444DController:
         sample_rate_hz: float,
         duration_ms: float,
         trigger_mv: float = 0.0,
+        pretrigger_ms: float = 0.0,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Triggered single-block capture.
+
+        pretrigger_ms is how much of duration_ms should come from *before*
+        the trigger event (clamped to duration_ms); the rest is post-trigger.
+        In the returned time_us, 0 marks the trigger event itself, so
+        pre-trigger samples come back with negative timestamps.
 
         Returns (time_us, voltage_mv) as NumPy arrays.
         """
@@ -423,21 +659,24 @@ class PicoScope5444DController:
         n_samples = min(
             int(actual_rate_hz * duration_ms / 1e3),
             max_samples.value,
-            10_000_000,  # 10 M sample safety cap
+            _PICO_MAX_SAMPLES,
         )
+        n_pretrigger = min(int(actual_rate_hz * pretrigger_ms / 1e3), n_samples)
+        n_posttrigger = n_samples - n_pretrigger
 
         ch_idx = _PICO_CHANNELS[self._channel]
         range_idx, _ = _PICO_RANGES[self._range]
         maxADC = ctypes.c_int16(_PICO_MAX_ADC)
 
-        # Configure trigger (rising edge, auto-trigger after 1 s)
+        # Configure trigger (auto-trigger after 1 s)
         threshold_adc = mV2adc(trigger_mv, range_idx, maxADC)
+        direction = 2 if self._trigger_edge == "rising" else 3  # PS5000A_RISING / _FALLING
         status = self._ps.ps5000aSetSimpleTrigger(
             self._handle,
             1,               # enable
             ch_idx,          # source
             threshold_adc,   # threshold in ADC counts
-            2,               # direction: PS5000A_RISING
+            direction,
             0,               # delay
             1000,            # autoTrigger_ms
         )
@@ -446,7 +685,7 @@ class PicoScope5444DController:
         # Arm and wait for block capture
         time_indisposed = ctypes.c_int32()
         status = self._ps.ps5000aRunBlock(
-            self._handle, 0, n_samples, timebase,
+            self._handle, n_pretrigger, n_posttrigger, timebase,
             ctypes.byref(time_indisposed), 0, None, None,
         )
         assert_pico_ok(status)
@@ -476,7 +715,9 @@ class PicoScope5444DController:
 
         n = c_n_samples.value
         voltage_mv = np.array(adc2mV(buf, range_idx, maxADC)[:n], dtype=float)
-        time_us = np.arange(n) / actual_rate_hz * 1e6
+        # Index n_pretrigger is the trigger event itself — t=0 — so
+        # pre-trigger samples come back with negative timestamps.
+        time_us = (np.arange(n) - n_pretrigger) / actual_rate_hz * 1e6
         return time_us, voltage_mv
 
 
@@ -487,6 +728,7 @@ class MockPicoScope5444DController:
     COUPLING_LABELS = PICO_COUPLING_LABELS
     RANGE_LABELS = PICO_RANGE_LABELS
     SAMPLE_RATES = PICO_SAMPLE_RATES
+    MAX_SAMPLES = _PICO_MAX_SAMPLES
 
     def __init__(self) -> None:
         self._channel = "A"
@@ -513,21 +755,30 @@ class MockPicoScope5444DController:
         self._channel = channel
         self._range = range_label
 
+    def configure_trigger_channel(
+        self, channel: str | None, range_label: str = "20 V", edge: str = "rising"
+    ) -> None:
+        pass  # simulated capture ignores trigger source entirely
+
     def capture_block(
         self,
         sample_rate_hz: float,
         duration_ms: float,
         trigger_mv: float = 0.0,
+        pretrigger_ms: float = 0.0,
     ) -> tuple[np.ndarray, np.ndarray]:
         n = int(sample_rate_hz * duration_ms / 1e3)
-        t_us = np.linspace(0, duration_ms * 1e3, n)
+        pretrigger_ms = min(pretrigger_ms, duration_ms)
+        t_us = np.linspace(-pretrigger_ms * 1e3, (duration_ms - pretrigger_ms) * 1e3, n)
 
         freq_hz = 10e6
         decay_us = duration_ms * 100
+        t_post = np.clip(t_us, 0, None)
         signal = (
             120.0
-            * np.exp(-t_us / decay_us)
-            * np.sin(2 * np.pi * freq_hz * t_us / 1e6)
+            * np.exp(-t_post / decay_us)
+            * np.sin(2 * np.pi * freq_hz * t_post / 1e6)
+            * (t_us >= 0)
         )
         noise = self._rng.normal(0, 8, n)
         return t_us, signal + noise
