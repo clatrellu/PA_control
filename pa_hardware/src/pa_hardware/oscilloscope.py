@@ -45,22 +45,6 @@ RP_DEFAULT_IP ="192.168.1.100"
  #"169.254.127.245"
 
 
-def _parse_voltage_data(raw: str) -> np.ndarray:
-    """Parse a Red Pitaya SCPI data response like '{v0,v1,...}' into a float array.
-
-    Returns an empty array rather than raising if the response is malformed
-    (e.g. an 'ERR!-3' error string), so callers never see a ValueError. The
-    raw response is logged so a malformed reply (buffer read racing the
-    acquisition, dropped bytes) is distinguishable from a genuinely missed
-    trigger instead of both looking like silent "no signal" frames.
-    """
-    try:
-        return np.fromstring(raw.strip("{}"), sep=",", dtype=float)
-    except ValueError:
-        _log.warning("Red Pitaya: malformed data response, dropping frame: %r", raw)
-        return np.array([], dtype=float)
-
-
 def _rate_to_decimation(rate_hz: float) -> int:
     """Return the smallest integer decimation that achieves >= rate_hz (clamped 1–65536)."""
     return max(1, min(65536, round(_RP_CLOCK_HZ / rate_hz)))
@@ -111,6 +95,16 @@ class OscilloscopeController:
 
     def _send(self, cmd: str) -> None:
         assert self._sock is not None, "Not connected"
+        # TCP_QUICKACK isn't permanent — the kernel lets it lapse after some
+        # idle period, and capture_block() has real gaps (the settle-sleep,
+        # the polling loop's sleep intervals) that can be long enough for
+        # that to happen. Re-applying it once here, right before every send,
+        # keeps it fresh regardless of how much idle time preceded this
+        # command — a single setsockopt per send, not per chunk of a
+        # transfer, so it doesn't have the mid-bulk-transfer downside that
+        # ruled out doing this inside _recv() for bulk reads.
+        if _HAS_QUICKACK:
+            self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_QUICKACK, 1)
         _log.debug("Red Pitaya <- %s", cmd)
         self._sock.sendall((cmd + "\r\n").encode())
 
@@ -145,6 +139,64 @@ class OscilloscopeController:
     def _ask(self, cmd: str, bulk: bool = False) -> str:
         self._send(cmd)
         return self._recv(bulk=bulk)
+
+    def _recv_block(self) -> bytes:
+        """Read one IEEE-488.2 definite-length binary block: #<n><len><data>\\r\\n.
+
+        Used for binary sample-data replies (ACQ:DATA:FORMAT BIN, confirmed
+        against real hardware — see _ask_binary). Must NOT scan for \\r\\n as
+        a terminator like _recv() does: binary sample bytes can coincidentally
+        contain that exact sequence. The block's declared length is the only
+        reliable way to know where the data ends, so this reads exactly that
+        many bytes instead. No TCP_QUICKACK re-application here — this is a
+        bulk, potentially multi-chunk transfer, and that trick measured
+        *slower* for that case (see _recv's docstring).
+        """
+        assert self._sock is not None, "Not connected"
+        buf = b""
+        while len(buf) < 2:
+            chunk = self._sock.recv(2 - len(buf))
+            if not chunk:
+                raise ConnectionError("socket closed while reading block header")
+            buf += chunk
+        if buf[0:1] != b"#":
+            raise ValueError(f"expected an IEEE-488.2 block header, got {buf!r}")
+        n_len_digits = int(buf[1:2])
+        header_len = 2 + n_len_digits
+        while len(buf) < header_len:
+            chunk = self._sock.recv(header_len - len(buf))
+            if not chunk:
+                raise ConnectionError("socket closed while reading block length")
+            buf += chunk
+        data_len = int(buf[2:header_len])
+        total_len = header_len + data_len + 2  # +2 for the trailing \r\n
+        while len(buf) < total_len:
+            chunk = self._sock.recv(min(65536, total_len - len(buf)))
+            if not chunk:
+                break
+            buf += chunk
+        _log.debug("Red Pitaya -> <binary block, %d data bytes>", data_len)
+        return buf[header_len:header_len + data_len]
+
+    def _ask_binary(self, cmd: str) -> np.ndarray:
+        """Ask for sample data in ACQ:DATA:FORMAT BIN mode and parse the
+        reply as big-endian float32 — confirmed against real hardware to
+        already be in calibrated volts (ACQ:DATA:Units VOLTS), matching the
+        ASCII path's values exactly, so no separate calibration math needed.
+
+        Returns an empty array rather than raising on a malformed reply
+        (e.g. an "ERR!-3"-style error string instead of a real block, or a
+        buffer read racing the acquisition) — same resilience contract the
+        old ASCII parser had, so a hiccup drops one frame instead of halting
+        continuous acquisition.
+        """
+        self._send(cmd)
+        try:
+            payload = self._recv_block()
+        except (ValueError, ConnectionError) as exc:
+            _log.warning("Red Pitaya: malformed binary data response: %s", exc)
+            return np.array([], dtype=float)
+        return np.frombuffer(payload, dtype=">f4").astype(float)
 
     # ------------------------------------------------------------------
     # Connection
@@ -219,6 +271,14 @@ class OscilloscopeController:
             self._apply_channel_config()
 
     def _apply_channel_config(self) -> None:
+        # ACQ:RST resets more than just gain — it also reverts the data
+        # format/units below back to their ASCII/VOLTS defaults. This method
+        # already runs after every RST (from connect() and, via
+        # _configure_acquisition(), on every parameter change), so it's the
+        # right place to keep BIN format asserted too, the same way gain is.
+        self._send("ACQ:DATA:FORMAT BIN")
+        self._send("ACQ:DATA:Units VOLTS")
+
         ch = _CHANNELS[self._channel]
         gain, _ = _RANGES[self._range]
         self._send(f"ACQ:SOUR{ch}:GAIN {gain}")
@@ -370,13 +430,12 @@ class OscilloscopeController:
     def _read_samples(self, ch: int, trig_pos: int, n_samples: int) -> np.ndarray:
         """Read n_samples from the circular buffer starting at trig_pos, handling wrap-around."""
         if trig_pos + n_samples <= _BUFFER_SIZE:
-            raw = self._ask(f"ACQ:SOUR{ch}:DATA:STA:N? {trig_pos},{n_samples}", bulk=True)
-            return _parse_voltage_data(raw)
+            return self._ask_binary(f"ACQ:SOUR{ch}:DATA:STA:N? {trig_pos},{n_samples}")
         n1 = _BUFFER_SIZE - trig_pos
         n2 = n_samples - n1
-        r1 = self._ask(f"ACQ:SOUR{ch}:DATA:STA:N? {trig_pos},{n1}", bulk=True)
-        r2 = self._ask(f"ACQ:SOUR{ch}:DATA:STA:N? 0,{n2}", bulk=True)
-        return np.concatenate([_parse_voltage_data(r1), _parse_voltage_data(r2)])
+        r1 = self._ask_binary(f"ACQ:SOUR{ch}:DATA:STA:N? {trig_pos},{n1}")
+        r2 = self._ask_binary(f"ACQ:SOUR{ch}:DATA:STA:N? 0,{n2}")
+        return np.concatenate([r1, r2])
 
 
 class MockOscilloscopeController:
