@@ -312,6 +312,9 @@ class MainWindow(QMainWindow):
     @pyqtSlot()
     def _on_scope_connect(self) -> None:
         scope_label = _SCOPE_NAMES.get(self._scope_type, self._scope_type)
+        # Continuous acquisition runs in a child process that holds the
+        # scope connection; get it back before checking/changing it here.
+        self._scope_widget.stop_acquisition()
         if self._scope.is_connected:
             self._scope.disconnect()
             self._scope_widget.set_scope(self._scope)
@@ -435,6 +438,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._stop_laser_status_polling()
+        self._scope_widget.stop_acquisition()
         self._scan_widget.shutdown()
         for dev in (self._laser, self._stage, self._scope):
             try:

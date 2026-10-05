@@ -271,6 +271,31 @@ class OscilloscopeController:
     def is_connected(self) -> bool:
         return self._sock is not None
 
+    def connection_config(self) -> dict:
+        """Everything needed to rebuild an equivalent controller with its
+        own connection (e.g. in another process) via from_config()."""
+        return {
+            "ip": self._ip,
+            "port": self._port,
+            "timeout": self._timeout,
+            "channel": self._channel,
+            "coupling": self._coupling,
+            "range": self._range,
+            "trigger_channel": self._trigger_channel,
+            "trigger_range": self._trigger_range,
+            "trigger_edge": self._trigger_edge,
+        }
+
+    @classmethod
+    def from_config(cls, config: dict) -> OscilloscopeController:
+        """Unconnected controller with the settings from connection_config()."""
+        scope = cls(config["ip"], config["port"], config["timeout"])
+        scope.configure_channel(config["channel"], config["coupling"], config["range"])
+        scope.configure_trigger_channel(
+            config["trigger_channel"], config["trigger_range"], config["trigger_edge"]
+        )
+        return scope
+
     # ------------------------------------------------------------------
     # Configuration
     # ------------------------------------------------------------------

@@ -487,6 +487,9 @@ class ScanWidget(QWidget):
         if not self._stage.is_connected:
             self.log_message.emit("[Scan] Cannot start — stage not connected.")
             return
+        # Continuous acquisition on the Oscilloscope tab runs in a child
+        # process holding the scope connection; get it back first.
+        self._osc_widget.stop_acquisition()
         if not self._scope.is_connected:
             self.log_message.emit("[Scan] Cannot start — scope not connected.")
             return

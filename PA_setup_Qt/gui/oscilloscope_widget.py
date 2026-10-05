@@ -1,6 +1,7 @@
 """Oscilloscope display + acquisition control widget."""
 from __future__ import annotations
 import csv
+import multiprocessing
 import time
 from collections import deque
 from pathlib import Path
@@ -14,12 +15,22 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QThread, QObject, pyqtSignal, pyqtSlot
 
+from pa_hardware.oscilloscope import OscilloscopeController
+from gui import scope_process
+
 _AVERAGE_N = 50
 _RATE_WINDOW_N = 20  # frames averaged over for the live acquisition-rate readout
+# Minimum time between plot redraws. Redrawing every frame at the laser's
+# 100 Hz kept the GUI thread busy holding Python's GIL, which delayed the
+# acquisition thread enough to miss every other shot (headless, the same
+# capture loop caught all 100 Hz). Frames still all reach the average
+# buffer, Save and the rate readout — only redrawing is throttled.
+_REDRAW_INTERVAL_S = 1 / 30
 
 
 class _AcquisitionWorker(QObject):
-    data_ready = pyqtSignal(object, object)   # time_us, voltage_mv (np.ndarray)
+    # time_us, voltage_mv (np.ndarray), captured_at (time.monotonic())
+    data_ready = pyqtSignal(object, object, float)
     error = pyqtSignal(str)
     finished = pyqtSignal()
 
@@ -40,7 +51,7 @@ class _AcquisitionWorker(QObject):
                     # see OscilloscopeController.capture_block); skip so the
                     # plot holds the last real trace instead of going blank.
                     continue
-                self.data_ready.emit(t, v)
+                self.data_ready.emit(t, v, time.monotonic())
             except Exception as exc:
                 self.error.emit(str(exc))
                 break
@@ -65,11 +76,85 @@ class _AcquisitionWorker(QObject):
             if len(v) == 0:
                 self.error.emit("No trigger within timeout")
             else:
-                self.data_ready.emit(t, v)
+                self.data_ready.emit(t, v, time.monotonic())
         except Exception as exc:
             self.error.emit(str(exc))
         finally:
             self.finished.emit()
+
+
+class _ProcessAcquisitionWorker(QObject):
+    """Continuous Red Pitaya acquisition in a child process (see
+    gui/scope_process.py for why); this QObject only relays its frames.
+
+    The Red Pitaya takes one SCPI client at a time, so the GUI's own
+    controller is disconnected while the child runs and reconnected after.
+    Same signals and stop() as _AcquisitionWorker.
+    """
+    data_ready = pyqtSignal(object, object, float)
+    error = pyqtSignal(str)
+    finished = pyqtSignal()
+
+    def __init__(self, scope: OscilloscopeController, params: dict):
+        super().__init__()
+        self._scope = scope
+        self._params = params
+        self._running = False
+
+    def stop(self):
+        self._running = False
+
+    @pyqtSlot()
+    def run(self):
+        self._running = True
+        # spawn, not fork: forking a process that already runs Qt and
+        # several threads can deadlock the child.
+        ctx = multiprocessing.get_context("spawn")
+        frames = ctx.Queue()
+        stop = ctx.Event()
+        config = self._scope.connection_config()
+        self._scope.disconnect()
+        proc = ctx.Process(
+            target=scope_process.acquisition_main,
+            args=(config, self._params, frames, stop),
+            daemon=True,
+        )
+        proc.start()
+        try:
+            done = False
+            while not done:
+                if not self._running:
+                    stop.set()
+                done = self._relay(scope_process.drain(frames, 0.05))
+                if not done and not proc.is_alive():
+                    # It may have just exited after queueing "done".
+                    if not self._relay(scope_process.drain(frames, 0.5)):
+                        self.error.emit(
+                            f"acquisition process exited unexpectedly (code {proc.exitcode})"
+                        )
+                    done = True
+        finally:
+            stop.set()
+            proc.join(timeout=10)
+            if proc.is_alive():
+                proc.terminate()
+                proc.join()
+            try:
+                self._scope.connect()
+            except Exception as exc:
+                self.error.emit(f"Reconnecting to the scope failed: {exc}")
+            self.finished.emit()
+
+    def _relay(self, messages) -> bool:
+        """Emit queued child messages as signals; True once "done" is seen."""
+        for msg in messages:
+            if msg[0] == "frame":
+                self.data_ready.emit(msg[1], msg[2], msg[3])
+            elif msg[0] == "error":
+                self.error.emit(msg[1])
+            elif msg[0] == "done":
+                return True
+        return False
 
 
 class OscilloscopeWidget(QWidget):
@@ -90,6 +175,7 @@ class OscilloscopeWidget(QWidget):
         # live "Acq. rate" readout — measures actual achieved throughput,
         # not a theoretical one.
         self._frame_times: deque[float] = deque(maxlen=_RATE_WINDOW_N)
+        self._last_redraw = 0.0
         self._thread: QThread | None = None
         self._worker: _AcquisitionWorker | None = None
         self._setup_ui()
@@ -513,7 +599,10 @@ class OscilloscopeWidget(QWidget):
         self._lbl_acq_rate.setText("-- Hz")
 
         params = self._get_acq_params()
-        self._worker = _AcquisitionWorker(self._scope, params)
+        if continuous and isinstance(self._scope, OscilloscopeController):
+            self._worker = _ProcessAcquisitionWorker(self._scope, params)
+        else:
+            self._worker = _AcquisitionWorker(self._scope, params)
 
         self._thread = QThread()
         self._worker.moveToThread(self._thread)
@@ -548,6 +637,14 @@ class OscilloscopeWidget(QWidget):
             self._btn_continuous.setText("Continuous")
             self._stop_acquisition()
 
+    def stop_acquisition(self) -> None:
+        """Stop any running acquisition, for callers outside this widget
+        that need the scope connection itself: Continuous runs in a child
+        process holding the Red Pitaya's only connection, and this returns
+        once it has been handed back to the GUI's controller."""
+        self._stop_acquisition()
+        self._reset_buttons()
+
     def _stop_acquisition(self) -> None:
         if self._worker:
             self._worker.stop()
@@ -565,13 +662,14 @@ class OscilloscopeWidget(QWidget):
                 self._thread.wait()
         self._thread = None
         self._worker = None
+        self._refresh_plot()
 
     # ------------------------------------------------------------------
     # Slots
     # ------------------------------------------------------------------
 
-    @pyqtSlot(object, object)
-    def _on_data(self, time_us: np.ndarray, voltage_mv: np.ndarray) -> None:
+    @pyqtSlot(object, object, float)
+    def _on_data(self, time_us: np.ndarray, voltage_mv: np.ndarray, captured_at: float) -> None:
         self._last_time = time_us
         self._last_voltage = voltage_mv
 
@@ -581,16 +679,26 @@ class OscilloscopeWidget(QWidget):
             self._avg_buffer.clear()
         self._avg_buffer.append(voltage_mv)
 
-        self._curve.setData(time_us, self._display_voltage())
+        # Capture time, not arrival time: frames from the acquisition
+        # process can arrive in bursts, which would distort the rate.
+        self._frame_times.append(captured_at)
+        now = time.monotonic()
+        if now - self._last_redraw < _REDRAW_INTERVAL_S:
+            return
+        self._last_redraw = now
+        self._refresh_plot()
         self._btn_save.setEnabled(True)
         self._btn_save_average.setEnabled(True)
 
-        self._frame_times.append(time.monotonic())
         if len(self._frame_times) >= 2:
             elapsed = self._frame_times[-1] - self._frame_times[0]
             if elapsed > 0:
                 rate_hz = (len(self._frame_times) - 1) / elapsed
                 self._lbl_acq_rate.setText(f"{rate_hz:.1f} Hz")
+
+    def _refresh_plot(self) -> None:
+        if self._last_time is not None:
+            self._curve.setData(self._last_time, self._display_voltage())
 
     def _display_voltage(self) -> np.ndarray | None:
         """What the plot should show for the latest data: the running
@@ -604,8 +712,7 @@ class OscilloscopeWidget(QWidget):
     def _on_average_toggled(self, _checked: bool) -> None:
         """Re-render immediately with whatever's already buffered, rather
         than waiting for the next capture to reflect the new toggle state."""
-        if self._last_time is not None:
-            self._curve.setData(self._last_time, self._display_voltage())
+        self._refresh_plot()
 
     @pyqtSlot(str)
     def _on_error(self, msg: str) -> None:
@@ -617,6 +724,12 @@ class OscilloscopeWidget(QWidget):
         self._reset_buttons()
 
     def _reset_buttons(self) -> None:
+        # Frames skipped by the redraw throttle in _on_data: make sure the
+        # plot ends on the last one received.
+        self._refresh_plot()
+        if self._last_time is not None:
+            self._btn_save.setEnabled(True)
+            self._btn_save_average.setEnabled(True)
         self._btn_stop.setEnabled(False)
         self._btn_single.setEnabled(True)
         self._btn_continuous.blockSignals(True)
