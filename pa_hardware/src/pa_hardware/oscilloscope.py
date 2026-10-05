@@ -44,6 +44,25 @@ RP_SAMPLE_RATES: dict[str, float] = {
 RP_DEFAULT_IP ="192.168.1.100"
  #"169.254.127.245"
 
+# How capture_block reads the capture window (quick win #3):
+#   "tpos"   — ACQ:TPOS? + DATA:STA:N? (two queries, known-good).
+#   "verify" — does the "tpos" read, then also reads via DATA:LAT:N? on the
+#              same capture and logs whether the two match. Returns the
+#              "tpos" data, so the display stays trustworthy while testing.
+#   "latest" — ACQ:SOURx:DATA:LAT:N? only (one query). Verified on this
+#              firmware at 125 MS/s with no pre-trigger (550/550 exact
+#              matches); run "verify" once before relying on it with
+#              pre-trigger > 0 or another sample rate.
+_READ_MODE = "latest"
+
+# This firmware counts ACQ:TRIG:DLY from the middle of the buffer: verify
+# mode measured WPOS-TPOS = DLY + 8191 on every capture (DLY=1250 → 9441).
+# The "tpos" read doesn't care where the write pointer stops, but LAT:N?
+# does, so the other modes subtract this. LAT:N? also includes the sample
+# at WPOS, so stopping at WPOS-TPOS = n_posttrigger put its window one
+# sample late (verify: shift=1); hence 8192, stopping one sample earlier.
+_DLY_OFFSET = 8192
+
 
 def _rate_to_decimation(rate_hz: float) -> int:
     """Return the smallest integer decimation that achieves >= rate_hz (clamped 1–65536)."""
@@ -88,6 +107,12 @@ class OscilloscopeController:
         self._trigger_channel: str | None = None
         self._trigger_range = "20 V"
         self._trigger_edge = "rising"  # "rising" or "falling"
+        # Set in connect(): whether the firmware answers ACQ:TRIG:FILL? at
+        # all. If not, capture_block just uses its fixed settle wait.
+        self._has_fill_query = False
+        # [matches, total] for _READ_MODE == "verify"; None once verify has
+        # been disabled because the board didn't answer.
+        self._verify_counts: list[int] | None = [0, 0]
 
     # ------------------------------------------------------------------
     # SCPI transport
@@ -96,8 +121,8 @@ class OscilloscopeController:
     def _send(self, cmd: str) -> None:
         assert self._sock is not None, "Not connected"
         # TCP_QUICKACK isn't permanent — the kernel lets it lapse after some
-        # idle period, and capture_block() has real gaps (the settle-sleep,
-        # the polling loop's sleep intervals) that can be long enough for
+        # idle period, and capture_block() has real gaps (the settle wait,
+        # waiting for the GUI between captures) that can be long enough for
         # that to happen. Re-applying it once here, right before every send,
         # keeps it fresh regardless of how much idle time preceded this
         # command — a single setsockopt per send, not per chunk of a
@@ -216,6 +241,24 @@ class OscilloscopeController:
         self._send("ACQ:RST")
         self._apply_channel_config()
         self._armed_params = None
+        self._has_fill_query = self._probe_fill_query()
+        _log.info("Red Pitaya: ACQ:TRIG:FILL? supported: %s", self._has_fill_query)
+
+    def _probe_fill_query(self) -> bool:
+        """Check once whether the firmware answers ACQ:TRIG:FILL?.
+
+        Short timeout because this firmware silently drops commands it
+        doesn't know instead of replying (seen with ACQ:TRIG:POS?), which
+        would otherwise hang until the full socket timeout.
+        """
+        assert self._sock is not None, "Not connected"
+        self._sock.settimeout(0.5)
+        try:
+            return self._ask("ACQ:TRIG:FILL?") in ("0", "1")
+        except socket.timeout:
+            return False
+        finally:
+            self._sock.settimeout(self._timeout)
 
     def disconnect(self) -> None:
         if self._sock:
@@ -324,7 +367,8 @@ class OscilloscopeController:
         self._apply_channel_config()
         self._send(f"ACQ:DEC {decimation}")
         self._send(f"ACQ:TRIG:LEV {trig_v:.6f}")
-        self._send(f"ACQ:TRIG:DLY {n_posttrigger}")
+        dly = n_posttrigger if _READ_MODE == "tpos" else n_posttrigger - _DLY_OFFSET
+        self._send(f"ACQ:TRIG:DLY {dly}")
 
         self._decimation = decimation
         self._actual_rate = actual_rate
@@ -365,10 +409,12 @@ class OscilloscopeController:
             # Immediate capture: force the trigger right away.
             self._send("ACQ:TRIG NOW")
             deadline = time.monotonic() + 2.0
+            # No sleep between polls: _ask() already blocks on recv() waiting
+            # for the reply, so this doesn't busy-spin — a sleep here is just
+            # added latency on top of each already-blocking round-trip.
             while time.monotonic() < deadline:
                 if self._ask("ACQ:TRIG:STAT?") == "TD":
                     break
-                time.sleep(0.005)
         else:
             # Wait for a genuine edge (rising or falling, per
             # self._trigger_edge) at the requested threshold (up to 5 s) —
@@ -384,41 +430,83 @@ class OscilloscopeController:
             edge_suffix = "PE" if self._trigger_edge == "rising" else "NE"
             self._send(f"ACQ:TRIG CH{trig_ch}_{edge_suffix}")
             deadline = time.monotonic() + 5.0
+            # No sleep between polls — see the note in the trigger_mv == 0.0
+            # branch above.
             while time.monotonic() < deadline:
                 if self._ask("ACQ:TRIG:STAT?") == "TD":
                     break
-                time.sleep(0.005)
             else:
                 return np.array([]), np.array([])
 
         t_triggered = time.monotonic()
-        time.sleep(n_samples / actual_rate + 0.005)
+        n_posttrigger = n_samples - n_pretrigger
+        if _READ_MODE != "tpos":
+            # LAT:N? reads backwards from the write pointer, so unlike the
+            # TPOS read it needs the acquisition to have actually stopped
+            # (n_posttrigger samples after the trigger) — otherwise the
+            # window slides. FILL? ("buffer is full") can't confirm that, so
+            # wait out the post-trigger span instead. The trigger happened
+            # before we saw TD, so timing from here is conservative; for
+            # short windows this is microseconds.
+            remaining_s = t_triggered + n_posttrigger / actual_rate + 0.0005 - time.monotonic()
+            if remaining_s > 0:
+                time.sleep(remaining_s)
+        # Runs in every mode, including "latest": "latest" without it (only
+        # the short wait above) showed false triggers — >100 Hz with the
+        # laser at 100 Hz, and captures with the laser off — while "verify",
+        # which had it, didn't. The Red Pitaya OS 2.x example also waits for
+        # FILL? after TD before reading.
+        #
+        # The fixed wait below is the one the code has always used, known
+        # to work on this firmware. FILL? may only shorten it, never lengthen it or drop
+        # the frame: per the Red Pitaya docs FILL? means "buffer is full",
+        # which may never become 1 in some setups (seen once, with
+        # the trigger on the recorded channel itself), so if it hasn't
+        # reported 1 by the end of this wait we read anyway, as before.
+        settle_deadline = t_triggered + n_samples / actual_rate + 0.005
+        filled = False
+        if self._has_fill_query:
+            while time.monotonic() < settle_deadline:
+                if self._ask("ACQ:TRIG:FILL?") == "1":
+                    filled = True
+                    break
+        if not filled:
+            remaining_s = settle_deadline - time.monotonic()
+            if remaining_s > 0:
+                time.sleep(remaining_s)
         t_settled = time.monotonic()
 
-        # ACQ:TRIG:POS? goes unanswered on current firmware (REDPITAYA,
-        # INSTR2025,,01-21) — confirmed by probing the SCPI server directly,
-        # it silently drops the command instead of replying, which hung this
-        # read until the socket timeout. ACQ:TPOS? is the live equivalent.
-        # Still guarded by the fallback in case of a malformed reply.
-        try:
-            trig_pos = int(self._ask("ACQ:TPOS?"))
-        except ValueError:
-            trig_pos = 0
+        if _READ_MODE == "latest":
+            voltage_v = self._ask_binary(f"ACQ:SOUR{ch}:DATA:LAT:N? {n_samples}")
+        else:
+            # ACQ:TRIG:POS? goes unanswered on current firmware (REDPITAYA,
+            # INSTR2025,,01-21) — confirmed by probing the SCPI server
+            # directly, it silently drops the command instead of replying,
+            # which hung this read until the socket timeout. ACQ:TPOS? is the
+            # live equivalent. Still guarded by the fallback in case of a
+            # malformed reply.
+            try:
+                trig_pos = int(self._ask("ACQ:TPOS?"))
+            except ValueError:
+                trig_pos = 0
 
-        # Start reading n_pretrigger samples before the trigger position
-        # (wrapping through address 0 via modulo, same circular buffer
-        # _read_samples already handles wrapping forward past the end of).
-        start_pos = (trig_pos - n_pretrigger) % _BUFFER_SIZE
-        voltage_v = self._read_samples(ch, start_pos, n_samples)
+            # Start reading n_pretrigger samples before the trigger position
+            # (wrapping through address 0 via modulo, same circular buffer
+            # _read_samples already handles wrapping forward past the end of).
+            start_pos = (trig_pos - n_pretrigger) % _BUFFER_SIZE
+            voltage_v = self._read_samples(ch, start_pos, n_samples)
+            if _READ_MODE == "verify":
+                self._verify_latest_read(ch, trig_pos, n_samples, n_posttrigger, voltage_v)
         t_read = time.monotonic()
 
         _log.debug(
             "capture_block timing: arm+trigger-wait=%.1fms  settle-sleep=%.1fms  "
-            "TPOS+data-read=%.1fms  (n_samples=%d)",
+            "data-read=%.1fms  (n_samples=%d, mode=%s)",
             (t_triggered - t_arm_start) * 1e3,
             (t_settled - t_triggered) * 1e3,
             (t_read - t_settled) * 1e3,
             n_samples,
+            _READ_MODE,
         )
 
         n = len(voltage_v)
@@ -426,6 +514,82 @@ class OscilloscopeController:
         # pre-trigger samples come back with negative timestamps.
         time_us = (np.arange(n) - n_pretrigger) / actual_rate * 1e6
         return time_us, voltage_v * 1e3
+
+    def _verify_latest_read(
+        self,
+        ch: int,
+        trig_pos: int,
+        n_samples: int,
+        n_posttrigger: int,
+        reference: np.ndarray,
+    ) -> None:
+        """Read the same capture again via DATA:LAT:N? and log whether it
+        matches the known-good TPOS read. Also logs WPOS-TPOS: LAT:N? is
+        only correct if the write pointer stops at the last sample of the
+        window, n_posttrigger - 1 samples after the trigger (see _DLY_OFFSET).
+        """
+        expected_offset = n_posttrigger - 1
+        if self._verify_counts is None:
+            return
+        assert self._sock is not None, "Not connected"
+        # Short timeout: this firmware silently drops commands it doesn't
+        # know (seen with ACQ:TRIG:POS?), which would otherwise stall for the
+        # full socket timeout and kill the acquisition.
+        self._sock.settimeout(1.0)
+        try:
+            latest = self._ask_binary(f"ACQ:SOUR{ch}:DATA:LAT:N? {n_samples}")
+            try:
+                wpos_offset = (int(self._ask("ACQ:WPOS?")) - trig_pos) % _BUFFER_SIZE
+            except ValueError:
+                wpos_offset = None
+        except socket.timeout:
+            _log.warning(
+                "LAT:N? verify: no reply from the board — firmware likely doesn't "
+                "support DATA:LAT:N? (or WPOS?). Verify disabled; keep _READ_MODE = 'tpos'."
+            )
+            self._verify_counts = None
+            return
+        finally:
+            self._sock.settimeout(self._timeout)
+        match = latest.shape == reference.shape and np.array_equal(latest, reference)
+        self._verify_counts[1] += 1
+        if match:
+            self._verify_counts[0] += 1
+        elif self._verify_counts[1] - self._verify_counts[0] <= 10:
+            max_diff = (
+                float(np.max(np.abs(latest - reference)))
+                if latest.shape == reference.shape and len(latest) else float("nan")
+            )
+            _log.warning(
+                "LAT:N? verify MISMATCH: len %d vs %d, max |diff|=%.4g V, "
+                "WPOS-TPOS=%s (expected %d), shift=%s",
+                len(latest), len(reference), max_diff, wpos_offset, expected_offset,
+                self._find_shift(latest, reference),
+            )
+        matches, total = self._verify_counts
+        if total == 1 or total % 50 == 0:
+            _log.info(
+                "LAT:N? verify: %d/%d captures matched (last WPOS-TPOS=%s, expected %d)",
+                matches, total, wpos_offset, expected_offset,
+            )
+
+    @staticmethod
+    def _find_shift(latest: np.ndarray, reference: np.ndarray, max_shift: int = 32) -> int | None:
+        """Return k such that latest[i] == reference[i + k] over the overlap
+        (positive k: the LAT:N? window sits later than the TPOS window), or
+        None if no shift within ±max_shift gives an exact match.
+        """
+        n = min(len(latest), len(reference))
+        for k in sorted(range(-max_shift, max_shift + 1), key=abs):
+            if n - abs(k) < 16:
+                continue
+            if k >= 0:
+                a, b = latest[:n - k], reference[k:n]
+            else:
+                a, b = latest[-k:n], reference[:n + k]
+            if np.array_equal(a, b):
+                return k
+        return None
 
     def _read_samples(self, ch: int, trig_pos: int, n_samples: int) -> np.ndarray:
         """Read n_samples from the circular buffer starting at trig_pos, handling wrap-around."""

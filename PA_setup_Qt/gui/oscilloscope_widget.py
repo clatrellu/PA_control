@@ -49,6 +49,28 @@ class _AcquisitionWorker(QObject):
     def stop(self):
         self._running = False
 
+    @pyqtSlot()
+    def run_once(self):
+        """Single-shot capture, executed in the worker thread.
+
+        A plain function connected to QThread.started (the previous
+        approach) has no QObject to give Qt a thread affinity for, so it
+        actually runs on whichever thread emits the signal — in this case
+        the GUI thread itself, freezing the UI for up to 5s if a trigger is
+        slow to arrive. A real method on this QObject (already moved to the
+        worker thread) runs there instead, like run() already does.
+        """
+        try:
+            t, v = self._scope.capture_block(**self._params)
+            if len(v) == 0:
+                self.error.emit("No trigger within timeout")
+            else:
+                self.data_ready.emit(t, v)
+        except Exception as exc:
+            self.error.emit(str(exc))
+        finally:
+            self.finished.emit()
+
 
 class OscilloscopeWidget(QWidget):
     """Waveform display and acquisition controls — adapts to any scope backend."""
@@ -150,7 +172,7 @@ class OscilloscopeWidget(QWidget):
         settings.addWidget(QLabel("Trigger:"))
         self._spin_trigger = QDoubleSpinBox()
         self._spin_trigger.setRange(-5000.0, 5000.0)
-        self._spin_trigger.setValue(0.0)
+        self._spin_trigger.setValue(220.0)
         self._spin_trigger.setSuffix(" mV")
         self._spin_trigger.setFixedWidth(90)
         settings.addWidget(self._spin_trigger)
@@ -495,24 +517,14 @@ class OscilloscopeWidget(QWidget):
 
         self._thread = QThread()
         self._worker.moveToThread(self._thread)
-        self._thread.started.connect(self._worker.run)
+        if continuous:
+            self._thread.started.connect(self._worker.run)
+        else:
+            self._thread.started.connect(self._worker.run_once)
         self._worker.data_ready.connect(self._on_data)
         self._worker.error.connect(self._on_error)
         self._worker.finished.connect(self._on_worker_finished)
-
-        if not continuous:
-            # Single shot: run exactly once outside the worker loop
-            def _run_once():
-                try:
-                    t, v = self._scope.capture_block(**params)
-                    self._worker.data_ready.emit(t, v)
-                except Exception as exc:
-                    self._worker.error.emit(str(exc))
-                finally:
-                    self._worker.finished.emit()
-
-            self._thread.started.disconnect()
-            self._thread.started.connect(_run_once)
+        self._worker.finished.connect(self._thread.quit)
 
         self._btn_stop.setEnabled(True)
         self._btn_single.setEnabled(False)
